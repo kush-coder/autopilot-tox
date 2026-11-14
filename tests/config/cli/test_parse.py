@@ -1,0 +1,64 @@
+from __future__ import annotations
+
+import logging
+from typing import TYPE_CHECKING, Final
+
+import pytest
+
+from tox.config.cli.parse import get_options
+
+if TYPE_CHECKING:
+    from tox.config.cli.parse import Options
+    from tox.pytest import CaptureFixture
+
+
+def test_help_does_not_default_cmd(capsys: CaptureFixture) -> None:
+    with pytest.raises(SystemExit):
+        get_options("-h")
+    out, err = capsys.readouterr()
+    assert not err
+    assert "--verbose" in out
+    assert "subcommands:" in out
+
+
+@pytest.mark.parametrize("name", ["distlib.util", "filelock"])
+def test_verbosity_guess_disables_library_logger(name: str) -> None:
+    get_options("-rv")
+    assert logging.getLogger(name).disabled
+
+
+def test_verbosity_guess_miss_match(capsys: CaptureFixture) -> None:
+    result = get_options("-rv")
+    assert result.parsed.verbosity == 3
+
+    assert logging.getLogger().level == logging.INFO
+    logging.error("E")
+    logging.warning("W")
+    logging.info("I")
+    logging.debug("D")
+
+    out, _err = capsys.readouterr()
+    assert out == "ROOT: E\nROOT: W\nROOT: I\n"
+
+
+@pytest.mark.parametrize("arg", ["-av", "-va"])
+def test_verbosity(arg: str) -> None:
+    result = get_options(arg)
+    assert result.parsed.verbosity == 3
+
+
+@pytest.mark.parametrize(
+    ("args", "command", "factors"),
+    [
+        pytest.param(("-f", "py", "legacy"), "legacy", [["py", "legacy"]], id="cmd-name-as-later-value"),
+        pytest.param(("-f", "py", "run"), "legacy", [["py", "run"]], id="run-as-later-value"),
+        pytest.param(("-f", "py", "l"), "legacy", [["py", "l"]], id="alias-as-later-value"),
+        pytest.param(("run", "-f", "py", "legacy"), "run", [["py", "legacy"]], id="explicit-command-first"),
+        pytest.param(("-f", "py", "list", "-r"), "legacy", [["py", "list"]], id="cmd-name-then-option"),
+        pytest.param(("-f", "py", "legacy", "-f", "list"), "legacy", [["py", "legacy"], ["list"]], id="repeated"),
+        pytest.param(("-f", "py", "-e", "a", "list"), "list", [["py"]], id="cmd-after-single-value-option"),
+    ],
+)
+def test_multi_value_option_keeps_all_values(args: tuple[str, ...], command: str, factors: list[list[str]]) -> None:
+    result: Final[Options] = get_options(*args)
+    assert (result.parsed.command, result.parsed.factors) == (command, factors)

@@ -1,0 +1,422 @@
+from __future__ import annotations
+
+import re
+import sys
+from argparse import Namespace
+from textwrap import dedent
+from typing import TYPE_CHECKING, Final
+
+import pytest
+from packaging.requirements import Requirement
+
+from tox.config.loader.native import to_native
+from tox.config.loader.str_convert import StrConvert
+from tox.config.loader.stringify import stringify
+from tox.tox_env.python.pip.req_file import PythonConstraints, PythonDeps
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from tox.pytest import ToxProjectCreator
+
+_BACKSLASH_ESCAPE: Final[pytest.MarkDecorator] = pytest.mark.skipif(
+    sys.platform == "win32", reason=r"on windows the escaped \ is overloaded by path separator"
+)
+
+
+@pytest.mark.parametrize(
+    ("legacy_flag", "expected"),
+    [pytest.param("-r", "b", id="dash-r"), pytest.param("-c", "-c b", id="dash-c")],
+)
+def test_legacy_requirement_file(tmp_path: Path, legacy_flag: str, expected: str) -> None:
+    python_deps = PythonDeps(f"{legacy_flag}a.txt", tmp_path)
+    (tmp_path / "a.txt").write_text("b")
+    assert (python_deps.as_root_args, python_deps.options, [str(i) for i in python_deps.requirements]) == (
+        [legacy_flag, "a.txt"],
+        Namespace(),
+        [expected],
+    )
+
+
+@pytest.mark.parametrize("flag", ["-c", "-r", "-f", "-e"])
+def test_deps_bare_flag_no_argument(tmp_path: Path, flag: str) -> None:
+    # A one-argument flag with no argument reports a clean error, not an IndexError.
+    python_deps = PythonDeps(raw=flag, root=tmp_path)
+    with pytest.raises(ValueError, match="expected one argument"):
+        python_deps.requirements  # ruff:ignore[useless-expression]  # documents type for checker
+
+
+def test_deps_with_hash(tmp_path: Path) -> None:
+    # deps with --hash should raise an exception.
+    python_deps = PythonDeps(
+        raw="foo==1 --hash sha256:97a702083b0d906517b79672d8501eee470d60ae55df0fa9d4cfba56c7f65a82",
+        root=tmp_path,
+    )
+    with pytest.raises(ValueError, match="Cannot use --hash in deps list"):
+        _ = python_deps.requirements
+
+
+def test_deps_with_config_settings(tmp_path: Path) -> None:
+    python_deps: Final[PythonDeps] = PythonDeps(raw="foo==1 --config-settings editable_mode=compat", root=tmp_path)
+    with pytest.raises(ValueError, match="Cannot use --config-settings in deps list"):
+        _ = python_deps.requirements
+
+
+def test_constraints_with_editable_requirement(tmp_path: Path) -> None:
+    # A requirement smuggled onto a constraints line must be rejected.
+    (tmp_path / "constraints.txt").write_text("")
+    python_constraints = PythonConstraints("constraints.txt -e ./pkg", tmp_path)
+    with pytest.raises(ValueError, match="Cannot provide options in constraints list"):
+        _ = python_constraints.requirements
+
+
+def test_constraints_keep_static_same_line_option(tmp_path: Path) -> None:
+    (tmp_path / "constraints.txt").write_text("")
+    assert PythonConstraints("constraints.txt --pre", tmp_path).as_root_args == ["-c", "constraints.txt", "--pre"]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        pytest.param("--extra-index-url https://host/${INDEX_PART}", id="extra-index"),
+        pytest.param("--index-url=https://host/${INDEX_PART}", id="index-equals"),
+        pytest.param("--trusted-host ${INDEX_PART}", id="trusted-host"),
+    ],
+)
+def test_deps_pip_env_variable_cannot_add_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str) -> None:
+    monkeypatch.setenv("INDEX_PART", "value --index-url=https://other/simple")
+    with pytest.raises(ValueError, match="a requirement substitution cannot change pip options"):
+        _ = PythonDeps(line, tmp_path).as_root_args
+
+
+def test_deps_pip_env_variable_keeps_full_line_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PIP_OPTIONS", "--index-url https://host/simple --extra-index-url https://mirror/simple")
+    assert PythonDeps("${PIP_OPTIONS}\npkg", tmp_path).as_root_args == [
+        "pkg",
+        "-i",
+        "https://host/simple",
+        "--extra-index-url",
+        "https://mirror/simple",
+    ]
+
+
+def test_deps_pip_env_variable_cannot_change_line_boundary(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INDEX_PART", "cpu\n--index-url=https://other/simple")
+    with pytest.raises(ValueError, match="a requirement substitution cannot change pip options"):
+        _ = PythonDeps("--extra-index-url https://host/${INDEX_PART}", tmp_path).as_root_args
+
+
+def test_constraints_pip_env_variable_cannot_add_option(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CONSTRAINT_NAME", "stable.txt --index-url=https://other/simple")
+    with pytest.raises(ValueError, match="a requirement substitution cannot change pip options"):
+        _ = PythonConstraints("constraints/${CONSTRAINT_NAME}", tmp_path).as_root_args
+
+
+def test_deps_with_requirements_with_hash(tmp_path: Path) -> None:
+    # deps can point to a requirements file that has --hash.
+    requirements = tmp_path / "requirements.txt"
+    exp_hash = "sha256:97a702083b0d906517b79672d8501eee470d60ae55df0fa9d4cfba56c7f65a82"
+    requirements.write_text(f"foo==1 --hash {exp_hash}")
+    python_deps = PythonDeps(raw="-r requirements.txt", root=tmp_path)
+    assert len(python_deps.requirements) == 1
+    parsed_req = python_deps.requirements[0]
+    assert str(parsed_req.requirement) == "foo==1"
+    assert (parsed_req.options, parsed_req.from_file) == ({"hash": [exp_hash]}, str(requirements))
+
+
+def test_deps_with_no_deps(tmp_path: Path) -> None:
+    (tmp_path / "r.txt").write_text("urrlib3")
+    python_deps = PythonDeps(raw="-rr.txt\n--no-deps", root=tmp_path)
+
+    assert len(python_deps.requirements) == 1
+    parsed_req = python_deps.requirements[0]
+    assert str(parsed_req.requirement) == "urrlib3"
+
+    assert python_deps.options.no_deps is True
+    assert python_deps.as_root_args == ["-r", "r.txt", "--no-deps"]
+
+
+def test_req_with_no_deps(tmp_path: Path) -> None:
+    (tmp_path / "r.txt").write_text("--no-deps")
+    python_deps = PythonDeps(raw="-rr.txt", root=tmp_path)
+    with pytest.raises(ValueError, match="unrecognized arguments: --no-deps"):
+        python_deps.requirements  # ruff:ignore[useless-expression]  # documents type for checker
+
+
+def test_opt_only_req_file(tmp_path: Path) -> None:
+    (tmp_path / "r.txt").write_text("--use-feature fast-deps")
+    python_deps = PythonDeps(raw="-rr.txt", root=tmp_path)
+    assert not python_deps.requirements
+    assert python_deps.options == Namespace(features_enabled=["fast-deps"])
+
+
+@pytest.mark.parametrize(
+    ("first", "shown", "pip_args"),
+    [
+        pytest.param("foo", ["foo", "bar"], ["bar", "foo"], id="requirement"),
+        pytest.param("# note", ["# note", "bar"], ["bar"], id="comment"),
+    ],
+)
+def test_req_iadd_after_read(tmp_path: Path, first: str, shown: list[str], pip_args: list[str]) -> None:
+    deps = PythonDeps(raw=first, root=tmp_path)
+    deps.as_root_args  # ruff:ignore[useless-expression]  # documents type for checker
+    deps += PythonDeps(raw="bar", root=tmp_path)
+    assert (deps.lines(), deps.as_root_args) == (shown, pip_args)
+
+
+def test_deps_add_keeps_environment_provider(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VAR", "host")
+    (tmp_path / "req.txt").write_text("https://${VAR}/pkg.whl")
+    deps: Final[PythonDeps] = PythonDeps("-r req.txt", tmp_path, environment_provider=lambda: {"VAR": "inside"})
+
+    assert sorted(str(req) for req in (deps + PythonDeps("other", tmp_path)).requirements) == [
+        "https://inside/pkg.whl",
+        "other",
+    ]
+
+
+def test_deps_factory_invalid_list(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="deps expected str, list\\[str\\], or list\\[Requirement\\]") as exc_info:
+        PythonDeps.factory(tmp_path, ["ok", 42, "also-ok"])
+    assert "got list with invalid items: [1] int" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        pytest.param("\n--find-links=/tmp/other", id="line-break"),
+        pytest.param("\\", id="line-continuation"),
+    ],
+)
+def test_provision_requirement_entry_cannot_change_lines(tmp_path: Path, suffix: str) -> None:
+    with pytest.raises(ValueError, match="a requirement entry cannot contain a line break or end in a backslash"):
+        PythonDeps.factory(tmp_path, [Requirement(f"plug @ file:///tmp/plug.whl#{suffix}")])
+
+
+def test_deps_factory_invalid_type(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="deps expected str, list\\[str\\], or list\\[Requirement\\]") as exc_info:
+        PythonDeps.factory(tmp_path, 123)
+    assert "got int: 123" in str(exc_info.value)
+
+
+def test_constraints_factory_invalid_list(tmp_path: Path) -> None:
+    with pytest.raises(
+        TypeError, match="constraints expected str, list\\[str\\], or list\\[Requirement\\]"
+    ) as exc_info:
+        PythonConstraints.factory(tmp_path, [["nested"]])
+    assert "got list with invalid items: [0] list" in str(exc_info.value)
+
+
+def test_constraints_factory_invalid_type(tmp_path: Path) -> None:
+    with pytest.raises(
+        TypeError, match="constraints expected str, list\\[str\\], or list\\[Requirement\\]"
+    ) as exc_info:
+        PythonConstraints.factory(tmp_path, {"key": "val"})
+    assert "got dict: {'key': 'val'}" in str(exc_info.value)
+
+
+def test_deps_unroll_binary_options_deterministic(tmp_path: Path) -> None:
+    # Set-valued options must render in a stable order, or the install cache breaks across hash seeds.
+    raw = dedent("""\
+        --no-binary six,packaging
+        pkg
+    """)
+
+    options, _ = PythonDeps(raw=raw, root=tmp_path).unroll()
+
+    assert options == ["no_binary=packaging,six"]
+
+
+def test_unroll_redacts_secret_env_vars(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PYPI_TOKEN", "magic")
+    monkeypatch.setenv("LONG_PYPI_TOKEN", "magical")
+    monkeypatch.setenv("PYPI_HOST", "host")
+    nested: Final = dedent("""\
+        --index-url https://ci:${PYPI_TOKEN}@${PYPI_HOST}/simple
+        --find-links https://${PYPI_HOST}/${LONG_PYPI_TOKEN}/
+        https://ci:${PYPI_TOKEN}@${PYPI_HOST}/a.whl
+    """)
+    (tmp_path / "nested.txt").write_text(nested)
+    python_deps: Final = PythonDeps(raw="-r nested.txt\nhttps://${LONG_PYPI_TOKEN}@${PYPI_HOST}/b.whl", root=tmp_path)
+
+    assert python_deps.unroll() == (
+        ["index_url=['https://ci:*****@host/simple']", "find_links=['https://host/*******/']"],
+        ["https://ci:*****@host/a.whl", "https://*******@host/b.whl"],
+    )
+    assert python_deps.as_root_args == ["https://magical@host/b.whl", "-r", "nested.txt"]
+    assert [str(req) for req in python_deps.requirements] == [
+        "https://ci:magic@host/a.whl",
+        "https://magical@host/b.whl",
+    ]
+
+
+def test_deps_binary_options_accumulate_across_lines_and_files(tmp_path: Path) -> None:
+    # Like pip, --no-binary on separate lines (and in a nested requirements file) all apply.
+    (tmp_path / "nested.txt").write_text("--no-binary nested\n")
+    raw = dedent("""\
+        --no-binary six
+        -r nested.txt
+        --no-binary packaging
+        pkg
+    """)
+    python_deps = PythonDeps(raw=raw, root=tmp_path)
+
+    assert python_deps.unroll() == (["no_binary=nested,packaging,six"], ["pkg"])
+    assert python_deps.as_root_args == ["pkg", "-r", "nested.txt", "--no-binary", "packaging,six"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "shown", "pip_args"),
+    [
+        pytest.param(
+            "--only-binary :all:\n--no-binary pkg\nrequests\n--no-binary other",
+            ["--only-binary :all:", "--no-binary other,pkg", "requests"],
+            ["requests", "--only-binary", ":all:", "--no-binary", "other,pkg"],
+            id="merged-at-first-line",
+        ),
+        pytest.param("--no-binary :all:\nrequests\n--no-binary :none:", ["requests"], ["requests"], id="cleared"),
+        pytest.param(
+            "requests\n--no-binary a\n--only-binary a",
+            ["requests", "--only-binary a"],
+            ["requests", "--only-binary", "a"],
+            id="moved-to-only-binary",
+        ),
+        pytest.param(
+            "# note\n--no-binary a\n--no-binary b  # why\npkg",
+            ["# note", "--no-binary a,b", "pkg"],
+            ["pkg", "--no-binary", "a,b"],
+            id="comment-kept",
+        ),
+        pytest.param(
+            "--no-binary a --pre\nrequests",
+            ["--pre", "--no-binary a", "requests"],
+            ["requests", "--pre", "--no-binary", "a"],
+            id="other-option-on-the-line",
+        ),
+    ],
+)
+def test_deps_show_binary_options_as_pip_gets_them(
+    tmp_path: Path, raw: str, shown: list[str], pip_args: list[str]
+) -> None:
+    python_deps = PythonDeps(raw, tmp_path)
+    assert (stringify(python_deps)[0].splitlines(), to_native(python_deps), python_deps.as_root_args) == (
+        shown,
+        shown,
+        pip_args,
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "shown", "pip_args"),
+    [
+        pytest.param(
+            "-i https://a/simple\npkg\n-i https://b/simple",
+            ["-i https://b/simple", "pkg"],
+            ["pkg", "-i", "https://b/simple"],
+            id="last-index-wins",
+        ),
+        pytest.param("--pre\npkg\n--pre", ["--pre", "pkg"], ["pkg", "--pre"], id="repeated-flag"),
+        pytest.param(
+            "--use-feature fast-deps\npkg\n--use-feature fast-deps",
+            ["--use-feature fast-deps", "pkg"],
+            ["pkg", "--use-feature", "fast-deps"],
+            id="repeated-feature",
+        ),
+        pytest.param("-i https://pypi.org/simple\npkg", ["pkg"], ["pkg"], id="default-index"),
+        pytest.param("# only a note", [], [], id="nothing-for-pip"),
+    ],
+)
+def test_deps_show_global_options_as_pip_gets_them(
+    tmp_path: Path, raw: str, shown: list[str], pip_args: list[str]
+) -> None:
+    python_deps = PythonDeps(raw, tmp_path)
+    assert (stringify(python_deps)[0].splitlines(), to_native(python_deps), python_deps.as_root_args) == (
+        shown,
+        shown,
+        pip_args,
+    )
+
+
+@_BACKSLASH_ESCAPE
+@pytest.mark.parametrize(
+    ("raw", "shown"),
+    [
+        pytest.param("--find-links a --pre", r"-f a\ --pre", id="find-links"),
+        pytest.param("-f a\t--pre", "-f a\\\t--pre", id="tab"),
+        pytest.param(r"-f 'a\ --pre'", r"-f a\\\ --pre", id="after-backslash"),
+        pytest.param("-i 'a --pre'", r"-i a\ --pre", id="quoted-index"),
+        pytest.param("--extra-index-url 'a --pre'", r"--extra-index-url a\ --pre", id="extra"),
+        pytest.param('--trusted-host "a --pre"', r"--trusted-host a\ --pre", id="host"),
+        pytest.param("""-i "a'b" """, r"-i a\'b", id="quote"),
+        pytest.param("--extra-index-url ''", "--extra-index-url ''", id="empty"),
+    ],
+)
+def test_deps_show_option_operand_as_one_operand(tmp_path: Path, raw: str, shown: str) -> None:
+    assert PythonDeps(f"{raw}\npkg", tmp_path).lines() == [shown, "pkg"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "pip_args"),
+    [
+        pytest.param("--find-links a --pre", ["-f", "a --pre"], id="find-links", marks=_BACKSLASH_ESCAPE),
+        pytest.param("-f a\t--pre", ["-f", "a\t--pre"], id="tab", marks=_BACKSLASH_ESCAPE),
+        pytest.param(r"-f 'a\ --pre'", ["-f", r"a\ --pre"], id="after-backslash", marks=_BACKSLASH_ESCAPE),
+        pytest.param("-i 'a --pre'", ["-i", "a --pre"], id="quoted-index"),
+        pytest.param("--extra-index-url 'a --pre'", ["--extra-index-url", "a --pre"], id="extra"),
+        pytest.param('--trusted-host "a --pre"', ["--trusted-host", "a --pre"], id="host"),
+        pytest.param("""-i "a'b" """, ["-i", "a'b"], id="quote"),
+        pytest.param("--extra-index-url ''", ["--extra-index-url", ""], id="empty"),
+    ],
+)
+def test_deps_option_operand_round_trip(tmp_path: Path, raw: str, pip_args: list[str]) -> None:
+    python_deps: Final = PythonDeps(f"{raw}\npkg", tmp_path)
+    assert python_deps.as_root_args == ["pkg", *pip_args]
+    assert PythonDeps(stringify(python_deps)[0], tmp_path).as_root_args == ["pkg", *pip_args]
+    assert StrConvert.to_command(" ".join(["pip", *python_deps.lines()])).args == ["pip", *pip_args, "pkg"]
+
+
+@pytest.mark.parametrize("option", [pytest.param("-r", id="requirement"), pytest.param("-c", id="constraint")])
+def test_deps_quoted_path_with_space(tmp_path: Path, option: str) -> None:
+    (tmp_path / "a b").mkdir()
+    (tmp_path / "a b" / "req.txt").write_text("pkg")
+    assert PythonDeps(f'{option} "a b/req.txt"', tmp_path).as_root_args == [option, "a b/req.txt"]
+
+
+@_BACKSLASH_ESCAPE
+@pytest.mark.parametrize(
+    "reference",
+    [pytest.param("{deps}", id="local"), pytest.param("{[testenv:inherits]deps}", id="inherited")],
+)
+def test_deps_reference_in_command_keeps_substituted_operand(
+    tox_project: ToxProjectCreator, monkeypatch: pytest.MonkeyPatch, reference: str
+) -> None:
+    monkeypatch.setenv("WHEELS", "wheels --index-url=https://x/simple")
+    ini: Final[str] = (
+        f"[testenv:inherits]\n[testenv]\ndeps =\n  -f {{env:WHEELS}}\n  pkg\ncommands = pip download {reference}"
+    )
+    result: Final = tox_project({"tox.ini": ini}).run("c", "-e", "py", "-k", "commands")
+    result.assert_success()
+    assert [command.args for command in result.env_conf("py")["commands"]] == [
+        ["pip", "download", "-f", "wheels --index-url=https://x/simple", "pkg"]
+    ]
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [pytest.param("--bogus", id="unknown-option"), pytest.param("pkg --hash=sha256:abc", id="hash-in-deps")],
+)
+def test_deps_show_raises_like_install(tmp_path: Path, raw: str) -> None:
+    with pytest.raises(ValueError, match=r".") as from_install:
+        PythonDeps(raw, tmp_path).as_root_args  # ruff:ignore[useless-expression]  # documents type for checker
+    with pytest.raises(ValueError, match=rf"^{re.escape(str(from_install.value))}$"):
+        PythonDeps(raw, tmp_path).lines()
+
+
+def test_constraints_show_the_configured_entries(tmp_path: Path) -> None:
+    constraints = PythonConstraints("c.txt\nhttps://x/c.txt", tmp_path)
+    shown = ["c.txt", "https://x/c.txt"]
+    assert (stringify(constraints)[0].splitlines(), to_native(constraints), constraints.as_root_args) == (
+        shown,
+        shown,
+        ["-c", "c.txt", "-c", "https://x/c.txt"],
+    )

@@ -1,0 +1,379 @@
+from __future__ import annotations
+
+import shutil
+import tarfile
+from typing import TYPE_CHECKING, Final
+from zipfile import ZIP_DEFLATED, ZipFile
+
+import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from pathlib import Path
+
+    from pytest_mock import MockType
+
+    from tox.pytest import ToxProject, ToxProjectCreator, ToxRunOutcome
+
+
+@pytest.fixture(scope="session")
+def pkg_with_extras_project_wheel(
+    pkg_with_extras_project: Path,
+    pkg_builder: Callable[[Path, Path, list[str], bool], Path],
+) -> Path:
+    dist = pkg_with_extras_project / "dist"
+    pkg_builder(dist, pkg_with_extras_project, ["wheel"], False)
+    return next(dist.iterdir())
+
+
+def test_tox_install_pkg_wheel(tox_project: ToxProjectCreator, pkg_with_extras_project_wheel: Path) -> None:
+    proj = tox_project({"tox.ini": "[testenv]\nextras=docs,format"})
+    execute_calls = proj.patch_execute(lambda request: 0 if "install" in request.run_id else None)
+    proj.run("r", "-e", "py", "--installpkg", str(pkg_with_extras_project_wheel)).assert_success()
+    calls = [(i[0][0].conf.name, i[0][3].run_id, i[0][3].cmd[5:]) for i in execute_calls.call_args_list]
+    deps = ["black>=3", "colorama>=0.4.6", "flake8", "platformdirs>=4.3.8", "sphinx-rtd-theme<1,>=0.4.3", "sphinx>=3"]
+    expected = [
+        ("py", "install_package_deps", deps),
+        ("py", "install_package", ["--force-reinstall", "--no-deps", str(pkg_with_extras_project_wheel)]),
+    ]
+    assert calls == expected
+
+
+@pytest.fixture(scope="session")
+def pkg_with_sdist(
+    pkg_with_extras_project: Path,
+    pkg_builder: Callable[[Path, Path, list[str], bool], Path],
+) -> Path:
+    dist = pkg_with_extras_project / "dist"
+    pkg_builder(dist, pkg_with_extras_project, ["sdist"], False)
+    return next(dist.iterdir())
+
+
+@pytest.fixture
+def pkg_with_extras_project_sdist(
+    pkg_with_extras_project: Path,
+    pkg_builder: Callable[[Path, Path, list[str], bool], Path],
+) -> Path:
+    dist = pkg_with_extras_project / "sdist"
+    pkg_builder(dist, pkg_with_extras_project, ["sdist"], False)
+    return next(dist.iterdir())
+
+
+def test_tox_install_pkg_sdist(tox_project: ToxProjectCreator, pkg_with_extras_project_sdist: Path) -> None:
+    proj = tox_project({"tox.ini": "[testenv]\nextras=docs,format"})
+    execute_calls = proj.patch_execute(lambda request: 0 if "install" in request.run_id else None)
+    proj.run("r", "-e", "py", "--installpkg", str(pkg_with_extras_project_sdist)).assert_success()
+    calls = [(i[0][0].conf.name, i[0][3].run_id, i[0][3].cmd[5:]) for i in execute_calls.call_args_list]
+    deps = ["black>=3", "colorama>=0.4.6", "flake8", "platformdirs>=4.3.8", "sphinx-rtd-theme<1,>=0.4.3", "sphinx>=3"]
+    assert calls == [
+        (".pkg_external_sdist_meta", "install_requires", ["setuptools"]),
+        (".pkg_external_sdist_meta", "_optional_hooks", []),
+        (".pkg_external_sdist_meta", "get_requires_for_build_sdist", []),
+        (".pkg_external_sdist_meta", "get_requires_for_build_wheel", []),  # required before prepare_metadata*
+        (".pkg_external_sdist_meta", "prepare_metadata_for_build_wheel", []),
+        ("py", "install_package_deps", deps),
+        ("py", "install_package", ["--force-reinstall", "--no-deps", str(pkg_with_extras_project_sdist)]),
+    ]
+
+
+@pytest.mark.parametrize("mode", ["p", "le"])  # no need for r as is tested above
+def test_install_pkg_via(tox_project: ToxProjectCreator, mode: str, pkg_with_extras_project_wheel: Path) -> None:
+    proj = tox_project({"tox.ini": "[testenv]\npackage=wheel"})
+    execute_calls = proj.patch_execute(lambda request: 0 if "install" in request.run_id else None)
+
+    proj.run(mode, "--installpkg", str(pkg_with_extras_project_wheel)).assert_success()
+    calls = [(i[0][0].conf.name, i[0][3].run_id) for i in execute_calls.call_args_list]
+    assert calls == [("py", "install_package_deps"), ("py", "install_package")]
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("enable_pip_pypi_access")
+def test_build_wheel_external_runs_once(
+    tox_project: ToxProjectCreator, demo_pkg_inline: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    toml = """
+    env_list = ["a", "b"]
+    [env_run_base]
+    package = "external"
+    package_env = ".ext"
+    commands = [["python", "-c", "from demo_pkg_inline import do; do()"]]
+    [env.".ext"]
+    deps = ["build"]
+    package_glob = "{env_tmp_dir}/dist/*.whl"
+    commands = [["pyproject-build", "-w", ".", "-o", "{env_tmp_dir}/dist"]]
+    """
+    project = tox_project({"tox.toml": toml})
+    monkeypatch.delenv("PIP_EXTRA_INDEX_URL", raising=False)
+    monkeypatch.delenv("PIP_INDEX_URL", raising=False)
+
+    result = project.run("r", "--root", str(demo_pkg_inline), "--workdir", str(project.path))
+
+    result.assert_success()
+    assert result.out.count("pyproject-build") == 1
+    assert result.out.count("greetings from demo_pkg_inline") == 2
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("enable_pip_pypi_access")
+def test_build_wheel_external(
+    tox_project: ToxProjectCreator, demo_pkg_inline: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ini = """
+    [testenv]
+    package = external
+    package_env = .ext
+    commands =
+        python -c 'from demo_pkg_inline import do; do()'
+
+    [testenv:.ext]
+    deps = build
+    package_glob = {envtmpdir}{/}dist{/}*.whl
+    commands =
+        pyproject-build -w . -o {envtmpdir}{/}dist
+    """
+    project = tox_project({"tox.ini": ini})
+    monkeypatch.delenv("PIP_EXTRA_INDEX_URL", raising=False)
+    monkeypatch.delenv("PIP_INDEX_URL", raising=False)
+
+    result = project.run("r", "--root", str(demo_pkg_inline), "--workdir", str(project.path))
+
+    result.assert_success()
+    assert "greetings from demo_pkg_inline" in result.out
+
+
+def test_build_wheel_external_relative_glob_uses_project(
+    tox_project: ToxProjectCreator, pkg_with_extras_project_wheel: Path
+) -> None:
+    ini: Final[str] = (
+        "[testenv]\npackage=external\n[testenv:.pkg_external]\npackage_glob=dist/*.whl\ncommands=python -c pass"
+    )
+    project: Final[ToxProject] = tox_project({"tox.ini": ini})
+    dist: Final[Path] = project.path / "dist"
+    dist.mkdir()
+    wheel: Final[Path] = dist / pkg_with_extras_project_wheel.name
+    shutil.copy(pkg_with_extras_project_wheel, wheel)
+    execute_calls: Final[MockType] = project.patch_execute(lambda run: 0 if "install" in run.run_id else None)
+
+    result: Final[ToxRunOutcome] = project.run("r", "-e", "py", "-c", project.path.name, from_cwd=project.path.parent)
+
+    result.assert_success()
+    assert [call[0][3].cmd[-1] for call in execute_calls.call_args_list if call[0][3].run_id == "install_package"] == [
+        str(wheel)
+    ]
+
+
+def test_build_wheel_external_default_glob_work_dir_with_brackets(
+    tox_project: ToxProjectCreator, pkg_with_extras_project_wheel: Path
+) -> None:
+    wheel: Final[Path] = pkg_with_extras_project_wheel
+    ini: Final[str] = f"""
+    [testenv]
+    package = external
+    [testenv:.pkg_external]
+    commands =
+        python -c 'from pathlib import Path; (Path(r"{{env_tmp_dir}}") / "dist").mkdir()'
+        python -c 'import shutil; shutil.copy(r"{wheel}", r"{{env_tmp_dir}}{{/}}dist")'
+    """
+    project: Final[ToxProject] = tox_project({"tox.ini": ini})
+    work_dir: Final[Path] = project.path / "work[1]"
+    execute_calls: Final[MockType] = project.patch_execute(lambda run: 0 if "install" in run.run_id else None)
+
+    result: Final[ToxRunOutcome] = project.run("r", "-e", "py", "--workdir", str(work_dir))
+
+    result.assert_success()
+    assert [call[0][3].cmd[-1] for call in execute_calls.call_args_list if call[0][3].run_id == "install_package"] == [
+        str(work_dir / ".pkg_external" / "tmp" / "dist" / wheel.name)
+    ]
+
+
+def test_build_wheel_external_relative_glob_root_with_brackets(
+    tox_project: ToxProjectCreator, pkg_with_extras_project_wheel: Path, tmp_path: Path
+) -> None:
+    ini: Final[str] = (
+        "[testenv]\npackage=external\n[testenv:.pkg_external]\npackage_glob=dist/*.whl\ncommands=python -c pass"
+    )
+    project: Final[ToxProject] = tox_project({"tox.ini": ini})
+    dist: Final[Path] = project.path / "dist"
+    dist.mkdir()
+    shutil.copy(pkg_with_extras_project_wheel, dist / pkg_with_extras_project_wheel.name)
+    root: Final[Path] = tmp_path / "proj[1]"
+    shutil.copytree(project.path, root)
+    execute_calls: Final[MockType] = project.patch_execute(lambda run: 0 if "install" in run.run_id else None)
+
+    result: Final[ToxRunOutcome] = project.run("r", "-e", "py", "--root", str(root), "--workdir", str(tmp_path / "w"))
+
+    result.assert_success()
+    assert [call[0][3].cmd[-1] for call in execute_calls.call_args_list if call[0][3].run_id == "install_package"] == [
+        str(root / "dist" / pkg_with_extras_project_wheel.name)
+    ]
+
+
+def test_build_wheel_external_fail_build(tox_project: ToxProjectCreator) -> None:
+    ini = """
+    [testenv]
+    package = external
+    [testenv:.pkg_external]
+    commands = xyz
+    """
+    result = tox_project({"tox.ini": ini}).run("r")
+
+    result.assert_failed()
+    assert "stopping as failed to build package" in result.out, result.out
+
+
+def test_build_wheel_external_fail_no_pkg(tox_project: ToxProjectCreator) -> None:
+    ini = """
+    [testenv]
+    package = external
+    """
+    result = tox_project({"tox.ini": ini}).run("r")
+
+    result.assert_failed()
+    assert "failed with no package found in " in result.out, result.out
+
+
+def test_build_wheel_external_fail_many_pkg(tox_project: ToxProjectCreator) -> None:
+    ini = """
+    [testenv]
+    package = external
+    [testenv:.pkg_external]
+    commands =
+        python -c 'from pathlib import Path; (Path(r"{env_tmp_dir}") / "dist").mkdir()'
+        python -c 'from pathlib import Path; (Path(r"{env_tmp_dir}") / "dist" / "a").write_text("")'
+        python -c 'from pathlib import Path; (Path(r"{env_tmp_dir}") / "dist" / "b").write_text("")'
+    """
+    result = tox_project({"tox.ini": ini}).run("r")
+
+    result.assert_failed()
+    assert "failed with found more than one package " in result.out, result.out
+
+
+def test_tox_install_pkg_bad_wheel(tox_project: ToxProjectCreator, tmp_path: Path) -> None:
+    wheel = tmp_path / "w.whl"
+    with ZipFile(str(wheel), "w"):
+        pass
+    result = tox_project({"tox.ini": "[testenv]"}).run("r", "-e", "py", "--installpkg", str(wheel))
+
+    result.assert_failed()
+    assert "failed with no .dist-info inside " in result.out, result.out
+
+
+@pytest.mark.parametrize(
+    ("malformed_install_pkg_artifact", "expected"),
+    [
+        pytest.param("not_gzip-1.0.tar.gz", "could not extract", id="invalid-gzip"),
+        pytest.param("no_members-1.0.tar.gz", "no files inside", id="empty-source-archive"),
+        pytest.param("not_a_zip-1.0-py3-none-any.whl", "the metadata of", id="invalid-wheel"),
+        pytest.param("invalid_utf8-1.0-py3-none-any.whl", "the metadata of", id="invalid-metadata-encoding"),
+        pytest.param("bad_requires-1.0-py3-none-any.whl", "the metadata of", id="invalid-requirement"),
+        pytest.param("missing_name-1.0-py3-none-any.whl", "no Name in the metadata of", id="missing-name"),
+        pytest.param("no_metadata-1.0-py3-none-any.whl", "the metadata of", id="missing-wheel-metadata"),
+    ],
+    indirect=["malformed_install_pkg_artifact"],
+)
+def test_tox_install_pkg_malformed(
+    tox_project: ToxProjectCreator, malformed_install_pkg_artifact: Path, expected: str
+) -> None:
+    result: Final[ToxRunOutcome] = tox_project({"tox.ini": "[testenv]"}).run(
+        "r", "-e", "py", "--installpkg", str(malformed_install_pkg_artifact)
+    )
+
+    result.assert_failed(1)
+    assert result.out.startswith("py: failed with ")
+    assert "internal error" not in result.out + result.err
+    assert expected in result.out
+    assert str(malformed_install_pkg_artifact) in result.out
+
+
+@pytest.fixture
+def malformed_install_pkg_artifact(tmp_path: Path, request: pytest.FixtureRequest) -> Path:
+    filename: Final[str] = request.param
+    artifact: Final[Path] = tmp_path / filename
+    if filename == "not_gzip-1.0.tar.gz":
+        artifact.write_bytes(b"not a gzip stream\n")
+    elif filename == "no_members-1.0.tar.gz":
+        with tarfile.open(str(artifact), "w:gz"):
+            pass
+    elif filename == "not_a_zip-1.0-py3-none-any.whl":
+        artifact.write_bytes(b"not a zip archive\n")
+    elif filename == "invalid_utf8-1.0-py3-none-any.whl":
+        with ZipFile(str(artifact), "w") as wheel:
+            wheel.writestr("invalid_utf8-1.0.dist-info/METADATA", b"Metadata-Version: 2.1\nName: invalid_utf8\n\xff")
+    elif filename == "bad_requires-1.0-py3-none-any.whl":
+        with ZipFile(str(artifact), "w") as wheel:
+            wheel.writestr(
+                "bad_requires-1.0.dist-info/METADATA",
+                "Metadata-Version: 2.1\nName: bad_requires\nVersion: 1.0\nRequires-Dist: requests => 2.0\n",
+            )
+    elif filename == "missing_name-1.0-py3-none-any.whl":
+        with ZipFile(str(artifact), "w") as wheel:
+            wheel.writestr("missing_name-1.0.dist-info/METADATA", "Metadata-Version: 2.1\nVersion: 1.0\n")
+    else:
+        with ZipFile(str(artifact), "w") as wheel:
+            wheel.writestr("no_metadata-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\n")
+    return artifact
+
+
+def test_tox_install_pkg_wheel_metadata_too_large(tox_project: ToxProjectCreator, tmp_path: Path) -> None:
+    wheel: Final[Path] = tmp_path / "demo-1.0-py3-none-any.whl"
+    with ZipFile(wheel, "w", ZIP_DEFLATED) as zip_file:
+        zip_file.writestr(
+            "demo-1.0.dist-info/METADATA",
+            b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n\n" + b"\n" * (16 * 1024 * 1024),
+        )
+        zip_file.writestr("demo-1.0.dist-info/WHEEL", b"Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+    result: Final[ToxRunOutcome] = tox_project({"tox.ini": "[testenv]"}).run(
+        "r", "-e", "py", "--installpkg", str(wheel)
+    )
+
+    result.assert_failed()
+    assert "demo-1.0.dist-info/METADATA inside " in result.out, result.out
+    assert "exceeds the 8388608 byte limit" in result.out, result.out
+
+
+def test_tox_install_pkg_with_skip_install(
+    tox_project: ToxProjectCreator,
+    demo_pkg_inline: Path,
+    demo_pkg_inline_wheel: Path,
+) -> None:
+    ini = "[testenv:foo]\nskip_install = true"
+    project = tox_project({"tox.ini": ini, "pyproject.toml": (demo_pkg_inline / "pyproject.toml").read_text()})
+    project.run("-e", "py", "--installpkg", str(demo_pkg_inline_wheel)).assert_success()
+
+
+def test_run_installpkg_targz(tox_project: ToxProjectCreator, pkg_with_sdist: Path) -> None:
+    project: Final = tox_project({
+        "tox.ini": """
+     [tox]
+    envlist = base, flake8
+    [testenv]
+    package = sdist
+    [testenv:base]
+    [testenv:flake8]
+    """
+    })
+    execute_calls: Final = project.patch_execute(lambda request: 0 if "install" in request.run_id else None)
+    project.run(f"--installpkg={pkg_with_sdist}").assert_success()
+    assert [
+        (i[0][0].conf.name, i[0][3].cmd[-1])
+        for i in execute_calls.call_args_list
+        if i[0][3].run_id == "install_package"
+    ] == [("base", str(pkg_with_sdist)), ("flake8", str(pkg_with_sdist))]
+
+
+def test_build_wheel_external_creates_change_dir(tox_project: ToxProjectCreator) -> None:
+    ini = """
+    [testenv]
+    package = external
+    [testenv:.pkg_external]
+    change_dir = {tox_root}{/}build-here
+    commands = python -c 'import pathlib, sys; pathlib.Path(sys.argv[1]).write_bytes(b"")' {envtmpdir}{/}dist{/}out.whl
+    """
+    project = tox_project({"tox.ini": ini})
+    build_dir = project.path / "build-here"
+    assert not build_dir.exists()
+
+    result = project.run("r")
+
+    assert build_dir.is_dir(), result.out
+    assert "No such file or directory" not in result.out, result.out

@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+import logging
+import sys
+from typing import TYPE_CHECKING
+
+import pytest
+
+from tox.config.cli.parser import ToxParser
+from tox.config.loader.memory import MemoryLoader
+from tox.config.sets import ConfigSet, CoreConfigSet, EnvConfigSet
+from tox.execute import Outcome
+from tox.plugin import impl
+from tox.plugin.manager import Plugin
+from tox.pytest import ToxProjectCreator, register_inline_plugin
+from tox.report import HandledError
+from tox.session.state import State
+from tox.tox_env.api import ToxEnv
+from tox.tox_env.python.virtual_env.runner import VirtualEnvRunner
+from tox.tox_env.register import ToxEnvRegister
+from tox.util.typing_compat import override
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pluggy
+    from pytest_mock import MockerFixture
+
+    from tox.tox_env.installer import InstallArguments
+
+
+def test_builtin_runner_cli_choice(tox_project: ToxProjectCreator) -> None:
+    tox_project({
+        "tox.toml": """
+        env_list = ["smoke"]
+        [env_run_base]
+        package = "skip"
+        """,
+    }).run("r", "--runner", "virtualenv", "--notest").assert_success()
+
+
+def test_external_runner_cli_choice(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    class ExternalRunner(VirtualEnvRunner):
+        @staticmethod
+        @override
+        def id() -> str:
+            return "external"
+
+    class ExternalPlugin:
+        @staticmethod
+        @impl
+        def tox_register_tox_env(register: ToxEnvRegister) -> None:
+            register.add_run_env(ExternalRunner)
+
+    def fake_load_entrypoints(  # interface signature
+        self: pluggy.PluginManager,
+        name: str,  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> None:
+        self.register(ExternalPlugin(), name="external_plugin")
+
+    project = tox_project({
+        "tox.toml": """
+        env_list = ["smoke"]
+        [env_run_base]
+        package = "skip"
+        """,
+    })
+    mocker.patch("pluggy.PluginManager.load_setuptools_entrypoints", fake_load_entrypoints)
+    mocker.patch("tox.plugin.manager.MANAGER", Plugin())
+    project.run("r", "--runner", "external", "--notest").assert_success()
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        pytest.param(
+            "'print(1)'", id="posix", marks=pytest.mark.skipif(sys.platform == "win32", reason="posix quoting")
+        ),
+        pytest.param(
+            "print(1)", id="windows", marks=pytest.mark.skipif(sys.platform != "win32", reason="windows quoting")
+        ),
+    ],
+)
+def test_plugin_hooks_and_order(tox_project: ToxProjectCreator, mocker: MockerFixture, cmd: str) -> None:
+    @impl
+    def tox_register_tox_env(register: ToxEnvRegister) -> None:
+        assert isinstance(register, ToxEnvRegister)
+        logging.warning("tox_register_tox_env")
+
+    @impl
+    def tox_add_option(parser: ToxParser) -> None:
+        assert isinstance(parser, ToxParser)
+        logging.warning("tox_add_option")
+
+    @impl
+    def tox_add_core_config(core_conf: CoreConfigSet, state: State) -> None:
+        assert isinstance(core_conf, CoreConfigSet)
+        assert isinstance(state, State)
+        logging.warning("tox_add_core_config")
+
+    @impl
+    def tox_add_env_config(env_conf: EnvConfigSet, state: State) -> None:
+        assert isinstance(env_conf, EnvConfigSet)
+        assert isinstance(state, State)
+        logging.warning("tox_add_env_config")
+
+    @impl
+    def tox_before_run_commands(tox_env: ToxEnv) -> None:
+        assert isinstance(tox_env, ToxEnv)
+        logging.warning("tox_before_run_commands")
+
+    @impl
+    def tox_on_install(tox_env: ToxEnv, arguments: InstallArguments, section: str, of_type: str) -> None:
+        assert isinstance(tox_env, ToxEnv)
+        assert arguments is not None
+        assert isinstance(section, str)
+        assert isinstance(of_type, str)
+        logging.warning("tox_on_install %s %s", section, of_type)
+
+    @impl
+    def tox_after_run_commands(tox_env: ToxEnv, exit_code: int, outcomes: list[Outcome]) -> None:
+        assert isinstance(tox_env, ToxEnv)
+        assert exit_code == 0
+        assert isinstance(outcomes, list)
+        assert all(isinstance(i, Outcome) for i in outcomes)
+        logging.warning("tox_after_run_commands")
+
+    @impl
+    def tox_env_teardown(tox_env: ToxEnv) -> None:
+        assert isinstance(tox_env, ToxEnv)
+        logging.warning("teardown")
+
+    plugins = tuple(v for v in locals().values() if callable(v) and hasattr(v, "tox_impl"))
+    assert len(plugins) == 8
+    register_inline_plugin(mocker, *plugins)
+
+    tox_ini = """
+        [tox]
+        env_list=a,b
+        [testenv]
+        package=skip
+        commands=python -c 'print(1)'
+        env_list=a,b
+    """
+    project = tox_project({"tox.ini": tox_ini})
+    result = project.run("r", "-e", "a,b")
+    result.assert_success()
+    expected = [
+        "ROOT: tox_register_tox_env",
+        "ROOT: tox_add_option",
+        "ROOT: tox_add_core_config",
+        "a: tox_add_env_config",
+        "b: tox_add_env_config",
+        "a: tox_on_install PythonRun deps",
+        "a: tox_before_run_commands",
+        f"a: commands[0]> python -c {cmd}",
+        mocker.ANY,  # output a
+        "a: tox_after_run_commands",
+        "a: teardown",
+        mocker.ANY,  # report finished A
+        "b: tox_on_install PythonRun deps",
+        "b: tox_before_run_commands",
+        f"b: commands[0]> python -c {cmd}",
+        mocker.ANY,  # output b
+        "b: tox_after_run_commands",
+        "b: teardown",
+        mocker.ANY,  # report a
+        mocker.ANY,  # report b
+        mocker.ANY,  # overall report
+    ]
+    assert result.out.splitlines() == expected, result.out
+
+
+@pytest.mark.parametrize(
+    "dir_name",
+    [
+        "tox_root",
+        "work_dir",
+        "temp_dir",
+    ],
+)
+def test_plugin_can_set_core_conf(
+    tox_project: ToxProjectCreator,
+    mocker: MockerFixture,
+    dir_name: str,
+    tmp_path: Path,
+) -> None:
+    @impl
+    def tox_add_core_config(  # interface signature
+        core_conf: CoreConfigSet,
+        state: State,  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> None:
+        core_conf.loaders.insert(0, MemoryLoader(**{dir_name: tmp_path}))
+
+    register_inline_plugin(mocker, tox_add_core_config)
+
+    result = tox_project({}).run("c")
+    result.assert_success()
+
+    assert result.state.conf.core[dir_name] == tmp_path
+
+
+def test_plugin_can_read_env_list(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    @impl
+    def tox_add_core_config(  # interface signature
+        core_conf: CoreConfigSet,  # ruff:ignore[unused-function-argument]  # interface signature
+        state: State,  # interface signature
+    ) -> None:
+        logging.warning("All envs: %s", ", ".join(state.envs.iter(only_active=False)))
+        logging.warning("Default envs: %s", ", ".join(state.envs.iter(only_active=True)))
+
+    register_inline_plugin(mocker, tox_add_core_config)
+    ini = """
+    [tox]
+    env_list = explicit
+    [testenv]
+    package = skip
+    set_env =
+        implicit: A=1
+    [testenv:section]
+    """
+    result = tox_project({"tox.ini": ini}).run()
+    assert "ROOT: All envs: explicit, section, implicit" in result.out
+    assert "ROOT: Default envs: explicit" in result.out
+
+
+def test_plugin_can_read_sections(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    @impl
+    def tox_add_core_config(  # interface signature
+        core_conf: CoreConfigSet,  # ruff:ignore[unused-function-argument]  # interface signature
+        state: State,  # interface signature
+    ) -> None:
+        logging.warning("Sections: %s", ", ".join(i.key for i in state.conf.sections()))
+
+    register_inline_plugin(mocker, tox_add_core_config)
+    ini = """
+    [tox]
+    [testenv]
+    package = skip
+    [testenv:section]
+    [other:section]
+    """
+    result = tox_project({"tox.ini": ini}).run()
+    result.assert_success()
+    assert "ROOT: Sections: tox, testenv, testenv:section, other:section" in result.out
+
+
+def test_plugin_injects_invalid_python_run(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    @impl
+    def tox_add_env_config(  # interface signature
+        env_conf: EnvConfigSet,
+        state: State,  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> None:
+        env_conf.loaders.insert(0, MemoryLoader(deps=[1]))
+        with pytest.raises(HandledError, match=r"failed to load py\.deps: deps expected"):
+            assert env_conf["deps"]
+
+    register_inline_plugin(mocker, tox_add_env_config)
+    result = tox_project({"tox.ini": "[testenv]\npackage=skip"}).run()
+    result.assert_failed()
+    assert "failed to load py.deps: deps expected" in result.out
+
+
+def test_plugin_extend_pass_env(
+    tox_project: ToxProjectCreator, mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    @impl
+    def tox_add_env_config(  # interface signature
+        env_conf: EnvConfigSet,
+        state: State,  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> None:
+        env_conf["pass_env"].append("MAGIC_*")
+
+    register_inline_plugin(mocker, tox_add_env_config)
+    ini = """
+    [testenv]
+    package=skip
+    commands=python -c 'import os; print(os.environ["MAGIC_1"]); print(os.environ["MAGIC_2"])'
+    """
+    project = tox_project({"tox.ini": ini})
+    monkeypatch.setenv("MAGIC_1", "magic_1")
+    monkeypatch.setenv("MAGIC_2", "magic_2")
+    result = project.run("r")
+    result.assert_success()
+    assert "magic_1" in result.out
+    assert "magic_2" in result.out
+
+    result_conf = project.run("c", "-e", "py", "-k", "pass_env")
+    result_conf.assert_success()
+    assert "MAGIC_*" in result_conf.out
+
+
+def test_plugin_extend_set_env(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    @impl
+    def tox_add_env_config(  # interface signature
+        env_conf: EnvConfigSet,
+        state: State,  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> None:
+        env_conf["set_env"].update({"MAGI_CAL": "magi_cal"})
+
+    register_inline_plugin(mocker, tox_add_env_config)
+    ini = """
+    [testenv]
+    package=skip
+    commands=python -c 'import os; print(os.environ["MAGI_CAL"])'
+    """
+    project = tox_project({"tox.ini": ini})
+    result = project.run("r")
+    result.assert_success()
+    assert "magi_cal" in result.out
+
+    result_conf = project.run("c", "-e", "py", "-k", "set_env")
+    result_conf.assert_success()
+    assert "MAGI_CAL=magi_cal" in result_conf.out
+
+
+def test_plugin_config_frozen_past_add_env(tox_project: ToxProjectCreator, mocker: MockerFixture) -> None:
+    def _cannot_extend_config(config_set: ConfigSet) -> None:
+        for conf in (
+            lambda config: config.add_constant("c", "desc", "v"),
+            lambda config: config.add_config("c", of_type=str, default="c", desc="d"),
+        ):
+            try:
+                conf(config_set)  # call to not typed function
+                raise NotImplementedError
+            except RuntimeError as exc:
+                # checks the message of the expected error
+                assert str(exc) == "config set has been marked final and cannot be extended"  # ruff:ignore[pytest-assert-in-except]
+
+    @impl
+    def tox_before_run_commands(tox_env: ToxEnv) -> None:
+        _cannot_extend_config(tox_env.conf)
+        _cannot_extend_config(tox_env.core)
+
+    @impl
+    def tox_after_run_commands(  # interface signature
+        tox_env: ToxEnv,
+        exit_code: int,  # ruff:ignore[unused-function-argument]  # interface signature
+        outcomes: list[Outcome],  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> None:
+        _cannot_extend_config(tox_env.conf)
+        _cannot_extend_config(tox_env.core)
+
+    register_inline_plugin(mocker, tox_before_run_commands, tox_after_run_commands)
+
+    tox_project({"tox.ini": "[testenv]\npackage=skip"}).run("r").assert_success()
+
+
+@pytest.mark.parametrize(
+    ("env_val", "expect_a", "expect_b"),
+    [
+        pytest.param("", True, True, id="none_disabled"),
+        pytest.param("dummy_plugin_a,dummy_plugin_b", False, False, id="both_disabled"),
+        pytest.param("dummy_plugin_a", False, True, id="only_a_disabled"),
+        pytest.param("dummy_plugin_b", True, False, id="only_b_disabled"),
+    ],
+)
+def test_disable_external_plugins(
+    tox_project: ToxProjectCreator,
+    env_val: str,
+    expect_a: bool,
+    expect_b: bool,
+    mocker: MockerFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DummyPluginA:
+        @staticmethod
+        @impl
+        def tox_add_option(  # interface signature
+            parser: ToxParser,  # ruff:ignore[unused-static-method-argument]  # interface signature
+        ) -> None:
+            logging.warning("dummy plugin A called")
+
+    class DummyPluginB:
+        @staticmethod
+        @impl
+        def tox_add_option(  # interface signature
+            parser: ToxParser,  # ruff:ignore[unused-static-method-argument]  # interface signature
+        ) -> None:
+            logging.warning("dummy plugin B called")
+
+    def fake_load_entrypoints(  # interface signature
+        self: pluggy.PluginManager,
+        name: str,  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> None:
+        self.register(DummyPluginA(), name="dummy_plugin_a")
+        self.register(DummyPluginB(), name="dummy_plugin_b")
+
+    project = tox_project({"tox.ini": ""})
+    mocker.patch("pluggy.PluginManager.load_setuptools_entrypoints", fake_load_entrypoints)
+    mocker.patch("tox.plugin.manager.MANAGER", Plugin())
+    monkeypatch.setenv("TOX_DISABLED_EXTERNAL_PLUGINS", env_val)
+    result = project.run("--version")
+
+    result.assert_success()
+    assert ("dummy plugin A called" in result.out) == expect_a
+    assert ("dummy plugin B called" in result.out) == expect_b

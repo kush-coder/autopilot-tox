@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tox.pytest import ToxProject
+
+
+def test_call_as_module(  # interface signature
+    empty_project: ToxProject,  # ruff:ignore[unused-function-argument]  # interface signature
+) -> None:
+    subprocess.check_output([sys.executable, "-m", "tox", "-h"])
+
+
+def test_call_as_exe(empty_project: ToxProject) -> None:  # ruff:ignore[unused-function-argument]  # interface signature
+    subprocess.check_output([str(Path(sys.executable).parent / "tox"), "-h"])

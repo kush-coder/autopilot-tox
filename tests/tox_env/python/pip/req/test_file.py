@@ -1,0 +1,841 @@
+from __future__ import annotations
+
+import os
+import socket
+import sys
+from argparse import Namespace
+from contextlib import contextmanager
+from http.client import HTTPResponse
+from io import BytesIO
+from typing import IO, TYPE_CHECKING, Final
+
+import pytest
+
+from tox.tox_env.python.pip.req.file import ParsedRequirement, RequirementsFile
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+    from pathlib import Path
+
+    from pytest_mock import MockerFixture
+
+    from tox.pytest import CaptureFixture, MonkeyPatch
+
+_REQ_FILE_TEST_CASES: Final[list[pytest.ParameterSet]] = [
+    pytest.param("--pre", {"pre": True}, [], ["--pre"], id="pre"),
+    pytest.param("--no-index", {"index_url": []}, [], ["--no-index"], id="no-index"),
+    pytest.param("--no-index\n-i a\n--no-index", {"index_url": []}, [], ["--no-index"], id="no-index overwrites index"),
+    pytest.param("--no-index\n-i a", {"index_url": []}, [], ["--no-index"], id="no-index before index"),
+    pytest.param(
+        "--no-index --extra-index-url a", {"index_url": []}, [], ["--no-index"], id="no-index with extra index"
+    ),
+    pytest.param(
+        "--no-index\n--extra-index-url a", {"index_url": []}, [], ["--no-index"], id="no-index before extra index"
+    ),
+    pytest.param("--prefer-binary", {"prefer_binary": True}, [], ["--prefer-binary"], id="prefer-binary"),
+    pytest.param("--require-hashes", {"require_hashes": True}, [], ["--require-hashes"], id="requires-hashes"),
+    pytest.param("--pre ", {"pre": True}, [], ["--pre"], id="space after"),
+    pytest.param(" --pre", {"pre": True}, [], ["--pre"], id="space before"),
+    pytest.param("--pre\\\n", {"pre": True}, [], ["--pre"], id="newline after"),
+    pytest.param("--pre # magic", {"pre": True}, [], ["--pre"], id="comment after space"),
+    pytest.param("--pre\t# magic", {"pre": True}, [], ["--pre"], id="comment after tab"),
+    pytest.param(
+        "--find-links /my/local/archives",
+        {"find_links": ["/my/local/archives"]},
+        [],
+        ["-f", "/my/local/archives"],
+        id="find-links path",
+    ),
+    pytest.param(
+        "--find-links /my/local/archives --find-links /my/local/archives",
+        {"find_links": ["/my/local/archives"]},
+        [],
+        ["-f", "/my/local/archives"],
+        id="find-links duplicate same line",
+    ),
+    pytest.param(
+        "--find-links /my/local/archives\n--find-links /my/local/archives",
+        {"find_links": ["/my/local/archives"]},
+        [],
+        ["-f", "/my/local/archives"],
+        id="find-links duplicate different line",
+    ),
+    pytest.param(
+        "--find-links \\\n/my/local/archives",
+        {"find_links": ["/my/local/archives"]},
+        [],
+        ["-f", "/my/local/archives"],
+        id="find-links newline path",
+    ),
+    pytest.param(
+        "--find-links http://some.archives.com/archives",
+        {"find_links": ["http://some.archives.com/archives"]},
+        [],
+        ["-f", "http://some.archives.com/archives"],
+        id="find-links url",
+    ),
+    pytest.param(
+        "--index-url a --find-links http://some.archives.com/archives",
+        {
+            "index_url": ["a"],
+            "find_links": ["http://some.archives.com/archives"],
+        },
+        [],
+        ["-i", "a", "-f", "http://some.archives.com/archives"],
+        id="index and find",
+    ),
+    pytest.param("-i a", {"index_url": ["a"]}, [], ["-i", "a"], id="index url short"),
+    pytest.param("--index-url a", {"index_url": ["a"]}, [], ["-i", "a"], id="index url long"),
+    pytest.param("-i a -i b\n-i c", {"index_url": ["c"]}, [], ["-i", "c"], id="index url multiple"),
+    pytest.param(
+        "--extra-index-url a",
+        {"index_url": ["https://pypi.org/simple", "a"]},
+        [],
+        ["--extra-index-url", "a"],
+        id="extra-index-url",
+    ),
+    pytest.param(
+        "--extra-index-url a --extra-index-url a",
+        {"index_url": ["https://pypi.org/simple", "a"]},
+        [],
+        ["--extra-index-url", "a"],
+        id="extra-index-url dup same line",
+    ),
+    pytest.param(
+        "--extra-index-url a\n--extra-index-url a",
+        {"index_url": ["https://pypi.org/simple", "a"]},
+        [],
+        ["--extra-index-url", "a"],
+        id="extra-index-url dup different line",
+    ),
+    pytest.param(
+        "--extra-index-url a\n--extra-index-url a --extra-index-url b",
+        {"index_url": ["https://pypi.org/simple", "a", "b"]},
+        [],
+        ["--extra-index-url", "a", "--extra-index-url", "b"],
+        id="extra-index-url mix seen and new",
+    ),
+    pytest.param("-e a", {}, ["-e a"], ["-e", "a"], id="e"),
+    pytest.param("--editable a", {}, ["-e a"], ["-e", "a"], id="editable"),
+    pytest.param("--editable .[2,1]", {}, ["-e .[1,2]"], ["-e", ".[1,2]"], id="editable extra"),
+    pytest.param(".[\t, a1. , B2-\t, C3_, ]", {}, [".[B2-,C3_,a1.]"], [".[B2-,C3_,a1.]"], id="path with extra"),
+    pytest.param(".[a.1]", {}, [f".{os.sep}.[a.1]"], [f".{os.sep}.[a.1]"], id="path with invalid extra is path"),
+    pytest.param("-f a", {"find_links": ["a"]}, [], ["-f", "a"], id="f"),
+    pytest.param("--find-links a", {"find_links": ["a"]}, [], ["-f", "a"], id="find-links"),
+    pytest.param("--trusted-host a", {"trusted_hosts": ["a"]}, [], ["--trusted-host", "a"], id="trusted-host"),
+    pytest.param(
+        "--trusted-host a --trusted-host a",
+        {"trusted_hosts": ["a"]},
+        [],
+        ["--trusted-host", "a"],
+        id="trusted-host dup same line",
+    ),
+    pytest.param(
+        "--trusted-host a\n--trusted-host a",
+        {"trusted_hosts": ["a"]},
+        [],
+        ["--trusted-host", "a"],
+        id="trusted-host dup different line",
+    ),
+    pytest.param(
+        "--use-feature 2020-resolver",
+        {"features_enabled": ["2020-resolver"]},
+        [],
+        ["--use-feature", "2020-resolver"],
+        id="use-feature space",
+    ),
+    pytest.param(
+        "--use-feature=fast-deps",
+        {"features_enabled": ["fast-deps"]},
+        [],
+        ["--use-feature", "fast-deps"],
+        id="use-feature equal",
+    ),
+    pytest.param(
+        "--use-feature=fast-deps --use-feature 2020-resolver",
+        {"features_enabled": ["2020-resolver", "fast-deps"]},
+        [],
+        ["--use-feature", "2020-resolver", "--use-feature", "fast-deps"],
+        id="use-feature multiple same line",
+    ),
+    pytest.param(
+        "--use-feature=fast-deps\n--use-feature 2020-resolver",
+        {"features_enabled": ["2020-resolver", "fast-deps"]},
+        [],
+        ["--use-feature", "2020-resolver", "--use-feature", "fast-deps"],
+        id="use-feature multiple different line",
+    ),
+    pytest.param(
+        "--use-feature=fast-deps\n--use-feature 2020-resolver\n" * 2,
+        {"features_enabled": ["2020-resolver", "fast-deps"]},
+        [],
+        ["--use-feature", "2020-resolver", "--use-feature", "fast-deps"],
+        id="use-feature multiple duplicate different line",
+    ),
+    pytest.param(
+        "--no-binary foo,bar",
+        {"no_binary": {"bar", "foo"}},
+        [],
+        ["--no-binary", "bar,foo"],
+        id="no-binary multiple joined",
+    ),
+    pytest.param("--no-binary :all:", {"no_binary": {":all:"}}, [], ["--no-binary", ":all:"], id="no-binary all"),
+    pytest.param("--no-binary :none:", {}, [], [], id="no-binary none"),
+    pytest.param(
+        "--only-binary :all:",
+        {"only_binary": {":all:"}},
+        [],
+        ["--only-binary", ":all:"],
+        id="only-binary all",
+    ),
+    pytest.param("--only-binary :none:", {}, [], [], id="only-binary none"),
+    pytest.param(
+        "--no-binary=foo --only-binary=foo",
+        {"only_binary": {"foo"}},
+        [],
+        ["--only-binary", "foo"],
+        id="no-binary-and-only-binary",
+    ),
+    pytest.param(
+        "--no-binary=foo --no-binary=:none:",
+        {},
+        [],
+        [],
+        id="no-binary-none-last",
+    ),
+    pytest.param(
+        "--only-binary=:none: --no-binary=foo",
+        {"no_binary": {"foo"}},
+        [],
+        ["--no-binary", "foo"],
+        id="no-binary-none-first",
+    ),
+    pytest.param(
+        "--no-binary foo\n--no-binary bar",
+        {"no_binary": {"bar", "foo"}},
+        [],
+        ["--no-binary", "bar,foo"],
+        id="no-binary multiple different line",
+    ),
+    pytest.param(
+        "--only-binary foo\n--only-binary bar",
+        {"only_binary": {"bar", "foo"}},
+        [],
+        ["--only-binary", "bar,foo"],
+        id="only-binary multiple different line",
+    ),
+    pytest.param(
+        "--no-binary foo\n--only-binary foo",
+        {"only_binary": {"foo"}},
+        [],
+        ["--only-binary", "foo"],
+        id="no-binary then only-binary on different lines",
+    ),
+    pytest.param(
+        "--no-binary foo\n--no-binary bar\n--no-binary :none:",
+        {},
+        [],
+        [],
+        id="no-binary none on a later line clears earlier lines",
+    ),
+    pytest.param(
+        "--only-binary foo\n--no-binary :all:",
+        {"no_binary": {":all:"}},
+        [],
+        ["--no-binary", ":all:"],
+        id="no-binary all on a later line drops earlier only-binary",
+    ),
+    pytest.param(
+        "--only-binary :all:\n--no-binary foo",
+        {"only_binary": {":all:"}, "no_binary": {"foo"}},
+        [],
+        ["--only-binary", ":all:", "--no-binary", "foo"],
+        id="only-binary all with no-binary exception on different lines",
+    ),
+    pytest.param(
+        "--only-binary :all: --no-binary foo",
+        {"only_binary": {":all:"}, "no_binary": {"foo"}},
+        [],
+        ["--only-binary", ":all:", "--no-binary", "foo"],
+        id="only-binary all with no-binary exception on the same line",
+    ),
+    pytest.param(
+        "--only-binary foo; sys_platform == 'aix'",
+        {"only_binary": {"foo;"}},
+        [],
+        ["--only-binary", "foo;"],
+        id="only-binary-and-env-marker",
+    ),
+    pytest.param("####### example-requirements.txt #######", {}, [], [], id="comment"),
+    pytest.param("\t##### Requirements without Version Specifiers ######", {}, [], [], id="tab and comment"),
+    pytest.param("  # start", {}, [], [], id="space and comment"),
+    pytest.param("nose", {}, ["nose"], ["nose"], id="req"),
+    pytest.param("nose\nnose", {}, ["nose"], ["nose"], id="req dup"),
+    pytest.param(
+        "numpy[2,1]  @ file://./downloads/numpy-1.9.2-cp34-none-win32.whl",
+        {},
+        ["numpy[1,2] @ file://./downloads/numpy-1.9.2-cp34-none-win32.whl"],
+        ["numpy[1,2] @ file://./downloads/numpy-1.9.2-cp34-none-win32.whl"],
+        id="path with name-extra-protocol",
+    ),
+    pytest.param(
+        "docopt == 0.6.1             # Version Matching. Must be version 0.6.1",
+        {},
+        ["docopt==0.6.1"],
+        ["docopt==0.6.1"],
+        id="req equal comment",
+    ),
+    pytest.param(
+        "keyring >= 4.1.1            # Minimum version 4.1.1",
+        {},
+        ["keyring>=4.1.1"],
+        ["keyring>=4.1.1"],
+        id="req ge comment",
+    ),
+    pytest.param(
+        "coverage != 3.5             # Version Exclusion. Anything except version 3.5",
+        {},
+        ["coverage!=3.5"],
+        ["coverage!=3.5"],
+        id="req ne comment",
+    ),
+    pytest.param(
+        "Mopidy-Dirble ~= 1.1        # Compatible release. Same as >= 1.1, == 1.*",
+        {},
+        ["Mopidy-Dirble~=1.1"],
+        ["Mopidy-Dirble~=1.1"],
+        id="req approx comment",
+    ),
+    pytest.param("b==1.3", {}, ["b==1.3"], ["b==1.3"], id="req eq"),
+    pytest.param("c >=1.2,<2.0", {}, ["c<2.0,>=1.2"], ["c<2.0,>=1.2"], id="req ge lt"),
+    pytest.param("d[bar,foo]", {}, ["d[bar,foo]"], ["d[bar,foo]"], id="req extras"),
+    pytest.param("d[foo, bar]", {}, ["d[bar,foo]"], ["d[bar,foo]"], id="req extras space"),
+    pytest.param("d[foo,\tbar]", {}, ["d[bar,foo]"], ["d[bar,foo]"], id="req extras tab"),
+    pytest.param("e~=1.4.2", {}, ["e~=1.4.2"], ["e~=1.4.2"], id="req approx"),
+    pytest.param(
+        "f ==5.4 ; python_version < '2.7'",
+        {},
+        ['f==5.4; python_version < "2.7"'],
+        ['f==5.4; python_version < "2.7"'],
+        id="python version filter",
+    ),
+    pytest.param(
+        "g; sys_platform == 'win32'",
+        {},
+        ['g; sys_platform == "win32"'],
+        ['g; sys_platform == "win32"'],
+        id="platform filter",
+    ),
+    pytest.param(
+        "http://w.org/w_P-3.0.3.dev1820+49a8884-cp34-none-win_amd64.whl",
+        {},
+        ["http://w.org/w_P-3.0.3.dev1820+49a8884-cp34-none-win_amd64.whl"],
+        ["http://w.org/w_P-3.0.3.dev1820+49a8884-cp34-none-win_amd64.whl"],
+        id="http URI",
+    ),
+    pytest.param(
+        "git+https://git.example.com/MyProject#egg=MyProject",
+        {},
+        ["git+https://git.example.com/MyProject#egg=MyProject"],
+        ["git+https://git.example.com/MyProject#egg=MyProject"],
+        id="vcs with https",
+    ),
+    pytest.param(
+        "git+ssh://git.example.com/MyProject#egg=MyProject",
+        {},
+        ["git+ssh://git.example.com/MyProject#egg=MyProject"],
+        ["git+ssh://git.example.com/MyProject#egg=MyProject"],
+        id="vcs with ssh",
+    ),
+    pytest.param(
+        "git+https://git.example.com/MyProject.git@da39a3ee5e6b4b0d3255bfef95601890afd80709#egg=MyProject",
+        {},
+        ["git+https://git.example.com/MyProject.git@da39a3ee5e6b4b0d3255bfef95601890afd80709#egg=MyProject"],
+        ["git+https://git.example.com/MyProject.git@da39a3ee5e6b4b0d3255bfef95601890afd80709#egg=MyProject"],
+        id="vcs with commit hash pin",
+    ),
+    pytest.param(
+        "attrs --hash sha384:142d9b02f3f4511ccabf6c14bd34d2b0a9ed043a898228b48343cfdf4eb10856ef7ad5e2ff2c528ecae04"
+        "912224782ab\t--hash=sha256:af957b369adcd07e5b3c64d2cdb76d6808c5e0b16c35ca41c79c8eee34808152 # ok",
+        {},
+        [
+            (
+                "attrs --hash sha256:af957b369adcd07e5b3c64d2cdb76d6808c5e0b16c35ca41c79c8eee34808152 --hash sha384:"
+                "142d9b02f3f4511ccabf6c14bd34d2b0a9ed043a898228b48343cfdf4eb10856ef7ad5e2ff2c528ecae04912224782ab"
+            ),
+        ],
+        ["attrs"],
+        id="hash",
+    ),
+    pytest.param(
+        "attrs --config-settings editable_mode=compat -C foo=bar",
+        {},
+        ["attrs --config-settings editable_mode=compat --config-settings foo=bar"],
+        ["attrs"],
+        id="config-settings",
+    ),
+    pytest.param(
+        "attrs -C foo=first -C foo=first -C foo=second --config-settings bar=other",
+        {},
+        [
+            (
+                "attrs --config-settings foo=first --config-settings foo=first "
+                "--config-settings foo=second --config-settings bar=other"
+            )
+        ],
+        ["attrs"],
+        id="config-settings-repeated",
+    ),
+    pytest.param(
+        "attrs --hash=sha256:af957b369adcd07e5b3c64d2cdb76d6808c5e0b16c35ca41c79c8eee34808152\\\n "
+        "--hash sha384:142d9b02f3f4511ccabf6c14bd34d2b0a9ed043a898228b48343cfdf4eb10856ef7ad5"
+        "e2ff2c528ecae04912224782ab\n",
+        {},
+        [
+            (
+                "attrs --hash sha256:af957b369adcd07e5b3c64d2cdb76d6808c5e0b16c35ca41c79c8eee34808152 --hash sha384:"
+                "142d9b02f3f4511ccabf6c14bd34d2b0a9ed043a898228b48343cfdf4eb10856ef7ad5e2ff2c528ecae04912224782ab"
+            ),
+        ],
+        ["attrs"],
+        id="hash with escaped newline",
+    ),
+    pytest.param(
+        "attrs --hash=sha512:7a91e5a3d1a1238525e477385ef5ee6cecdc8f8fcc2a79d1b35a9f57ad15c814"
+        "dada670026f41fdd62e5e10b3fd75d6112704a9521c3df105f0b6f3bb11b128a",
+        {},
+        [
+            (
+                "attrs --hash sha512:7a91e5a3d1a1238525e477385ef5ee6cecdc8f8fcc2a79d1b35a9f57ad15c814"
+                "dada670026f41fdd62e5e10b3fd75d6112704a9521c3df105f0b6f3bb11b128a"
+            ),
+        ],
+        ["attrs"],
+        id="sha512 hash is supported",
+    ),
+    pytest.param(
+        "\tp @ https://github.com/a/b/c/d.zip ",
+        {},
+        ["p @ https://github.com/a/b/c/d.zip"],
+        ["p @ https://github.com/a/b/c/d.zip"],
+        id="whitespace around",
+    ),
+]
+
+
+@pytest.mark.parametrize(("req", "opts", "requirements", "as_args"), _REQ_FILE_TEST_CASES)
+def test_req_file(
+    tmp_path: Path, req: str, opts: dict[str, bool | list[str]], requirements: list[str], as_args: list[str]
+) -> None:
+    requirements_txt = tmp_path / "req.txt"
+    requirements_txt.write_text(req)
+    req_file = RequirementsFile(requirements_txt, constraint=False)
+    assert req_file.as_root_args == as_args
+    assert str(req_file) == f"-r {requirements_txt}"
+    assert req_file.options == Namespace(**opts)
+    found = [str(i) for i in req_file.requirements]
+    assert found == requirements
+
+
+@pytest.mark.parametrize(
+    ("requirement", "expected"),
+    [
+        pytest.param("./a/b", f"a{os.sep}b", id="nested-path"),
+        pytest.param("./--log=outside/sentinel", f".{os.sep}--log=outside{os.sep}sentinel", id="option-like-path"),
+        pytest.param(
+            "a/../--report=outside/sentinel",
+            f".{os.sep}--report=outside{os.sep}sentinel",
+            id="resolved-option-like-path",
+        ),
+        pytest.param(
+            "a/../-routside/sentinel",
+            f".{os.sep}-routside{os.sep}sentinel",
+            id="resolved-short-option-like-path",
+        ),
+    ],
+)
+def test_local_requirement_remains_a_path(tmp_path: Path, requirement: str, expected: str) -> None:
+    requirements_file: Final[Path] = tmp_path / "req.txt"
+    requirements_file.write_text(requirement)
+    assert RequirementsFile(requirements_file, constraint=False).as_root_args == [expected]
+
+
+def test_requirements_env_var_present(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ENV_VAR", "beta")
+    requirements_file = tmp_path / "req.txt"
+    requirements_file.write_text("${ENV_VAR} >= 1")
+    req_file = RequirementsFile(requirements_file, constraint=False)
+    assert req_file.options == Namespace()
+    found = [str(i) for i in req_file.requirements]
+    assert found == ["beta>=1"]
+
+
+def test_requirements_env_var_missing(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("ENV_VAR", raising=False)
+    requirements_file = tmp_path / "req.txt"
+    requirements_file.write_text("${ENV_VAR}")
+    req_file = RequirementsFile(requirements_file, constraint=False)
+    assert req_file.options == Namespace()
+    found = [str(i) for i in req_file.requirements]
+    assert found == [f".{os.sep}${{ENV_VAR}}"]
+
+
+def test_requirements_env_var_from_environment_provider(monkeypatch: MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ENV_VAR", "host")
+    monkeypatch.setenv("OTHER_VAR", "host")
+    (tmp_path / "nested.txt").write_text("${OTHER_VAR}")
+    requirements_file: Final[Path] = tmp_path / "req.txt"
+    requirements_file.write_text("${ENV_VAR} >= 1\n-r nested.txt")
+    req_file: Final[RequirementsFile] = RequirementsFile(
+        requirements_file, constraint=False, environment_provider=lambda: {"ENV_VAR": "beta"}
+    )
+    assert [str(item) for item in req_file.requirements] == ["beta>=1", f".{os.sep}${{OTHER_VAR}}"]
+
+
+@pytest.mark.parametrize(
+    "flag", [pytest.param("-r", id="dash-r"), pytest.param("--requirement", id="dash-dash-requirement")]
+)
+def test_requirements_txt_transitive(tmp_path: Path, flag: str) -> None:
+    (tmp_path / "other-requirements.txt").write_text("magic\nmagical")
+    requirements_file = tmp_path / "req.txt"
+    requirements_file.write_text(f"{flag} other-requirements.txt\n{flag} other-requirements.txt")
+    req_file = RequirementsFile(requirements_file, constraint=False)
+    assert req_file.as_root_args == ["-r", "other-requirements.txt"]
+    assert req_file.as_root_args is req_file.as_root_args  # check it's cached
+    assert req_file.options == Namespace()
+    found = [str(i) for i in req_file.requirements]
+    assert found == ["magic", "magical"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "error"),
+    [
+        pytest.param(
+            "--pre something",
+            "unrecognized arguments: something",
+            id="dash-dash-pre-space-something-unrecognized-space-arguments-colon-space-something",
+        ),
+        pytest.param(
+            "--missing",
+            "unrecognized arguments: --missing",
+            id="dash-dash-missing-unrecognized-space-arguments-colon-space-dash-dash-missing",
+        ),
+        pytest.param(
+            "--index-url a b",
+            "unrecognized arguments: b",
+            id="dash-dash-index-dash-url-space-a-space-b-unrecognized-space-arguments-colon-space-b",
+        ),
+        pytest.param(
+            "--index-url",
+            "argument -i/--index-url/--pypi-url: expected one argument",
+            id="dash-dash-index-dash-url-argument-space-dash-i-slash-dash-dash-index-dash-url-slash-dash-dash-pypi-dash-url-colon-space-expected-space-one-space-argument",
+        ),
+        pytest.param("-k", "unrecognized arguments: -k", id="dash-k-unrecognized-space-arguments-colon-space-dash-k"),
+    ],
+)
+def test_bad_line(tmp_path: Path, raw: str, capfd: CaptureFixture, error: str) -> None:
+    requirements_file = tmp_path / "req.txt"
+    requirements_file.write_text(raw)
+    req_file = RequirementsFile(requirements_file, constraint=False)
+    with pytest.raises(ValueError, match=f"^{error}$"):
+        assert req_file.options
+    out, err = capfd.readouterr()
+    assert not out
+    assert not err
+
+
+def test_bad_line_masks_secret_flag(tmp_path: Path) -> None:
+    requirements_file: Final = tmp_path / "req.txt"
+    requirements_file.write_text("--api-token=hunter2")
+    with pytest.raises(ValueError, match="unrecognized arguments") as error:
+        _ = RequirementsFile(requirements_file, constraint=False).options
+    assert "--api-token=*******" in str(error.value)
+    assert "hunter2" not in str(error.value)
+
+
+def test_requirements_file_missing(tmp_path: Path) -> None:
+    requirements_file = tmp_path / "req.txt"
+    requirements_file.write_text("-r one.txt")
+    req_file = RequirementsFile(requirements_file, constraint=False)
+    with pytest.raises(ValueError, match=r"No such file or directory: .*one.txt"):
+        assert req_file.options
+
+
+@pytest.mark.parametrize(
+    "flag", [pytest.param("-c", id="dash-c"), pytest.param("--constraint", id="dash-dash-constraint")]
+)
+def test_constraint_txt_expanded(tmp_path: Path, flag: str) -> None:
+    (tmp_path / "other.txt").write_text("magic\nmagical\n-i a")
+    requirements_file = tmp_path / "req.txt"
+    requirements_file.write_text(f"{flag} other.txt\n{flag} other.txt")
+    req_file = RequirementsFile(requirements_file, constraint=True)
+    assert (req_file.as_root_args, req_file.options, [str(i) for i in req_file.requirements]) == (
+        ["-c", "other.txt"],
+        Namespace(index_url=["a"]),
+        ["-c magic", "-c magical"],
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason=r"on windows the escaped \ is overloaded by path separator")
+def test_req_path_with_space_escape(tmp_path: Path) -> None:
+    dep_requirements_file = tmp_path / "a b"
+    dep_requirements_file.write_text("c")
+    path = f"-r {dep_requirements_file!s}"
+    path = f"{path[: -len('a b')]}a\\ b"
+
+    requirements_file = tmp_path / "req.txt"
+    requirements_file.write_text(path)
+    req_file = RequirementsFile(requirements_file, constraint=False)
+
+    assert req_file.options == Namespace()
+    found = [str(i) for i in req_file.requirements]
+    assert found == ["c"]
+
+
+def test_req_path_with_space_quoted(tmp_path: Path) -> None:
+    (tmp_path / "a b").mkdir()
+    (tmp_path / "a b" / "base.txt").write_text("c")
+    (tmp_path / "a b" / "constraints.txt").write_text("d<2")
+    requirements_file: Final[Path] = tmp_path / "req.txt"
+    requirements_file.write_text('-r "a b/base.txt"\n-c "a b/constraints.txt"\n--index-url "https://a/simple"')
+    req_file: Final[RequirementsFile] = RequirementsFile(requirements_file, constraint=False)
+
+    assert req_file.options == Namespace(index_url=["https://a/simple"])
+    assert [str(i) for i in req_file.requirements] == ["c", "-c d<2"]
+
+
+@pytest.mark.parametrize(
+    "hash_value",
+    [
+        pytest.param("sha256:a", id="sha256-colon-a"),
+        pytest.param(
+            "sha256:xxxxxxxxxx123456789012345678901234567890123456789012345678901234",
+            id="sha256-colon-xxxxxxxxxx123456789012345678901234567890123456789012345678901234",
+        ),
+        (
+            pytest.param(
+                "sha512:thisshouldfail8525e477385ef5ee6cecdc8f8fcc2a79d1b35a9f57ad15c814"
+                "dada670026f41fdd62e5e10b3fd75d6112704a9521c3df105f0b6f3bb11b128a",
+                id="sha512-colon-thisshouldfail8525e477385ef5ee6cecdc8f8fcc2a79d1b35a9f57ad15c814dada670026f41fdd62e5e10b3fd75d6112704a9521c3df105f0b6f3bb11b128a",
+            )
+        ),
+    ],
+)
+def test_bad_hash(hash_value: str, tmp_path: Path) -> None:
+    requirements_txt = tmp_path / "req.txt"
+    requirements_txt.write_text(f"attrs --hash {hash_value}")
+    req_file = RequirementsFile(requirements_txt, constraint=False)
+    with pytest.raises(ValueError, match=f"^argument --hash: {hash_value}$"):
+        assert req_file.requirements
+
+
+@pytest.mark.parametrize(
+    "codec",
+    [
+        pytest.param("utf-8", id="utf-dash-8"),
+        pytest.param("utf-16", id="utf-dash-16"),
+        pytest.param("utf-32", id="utf-dash-32"),
+    ],
+)
+def test_custom_file_encoding(codec: str, tmp_path: Path) -> None:
+    requirements_file = tmp_path / "r.txt"
+    requirements_file.write_bytes("art".encode(codec))
+    req_file = RequirementsFile(requirements_file, constraint=False)
+    assert [str(i) for i in req_file.requirements] == ["art"]
+
+
+def test_non_utf8_file_encoding_falls_back_to_locale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("tox.tox_env.python.pip.req.file.locale.getpreferredencoding", lambda **_: "latin-1")
+    requirements_file = tmp_path / "r.txt"
+    requirements_file.write_bytes(b"art  # \xe9\n")
+    req_file = RequirementsFile(requirements_file, constraint=False)
+    assert [str(i) for i in req_file.requirements] == ["art"]
+
+
+def test_parsed_requirement_properties(tmp_path: Path) -> None:
+    req = ParsedRequirement("a", {"b": 1}, str(tmp_path), 1)
+    assert req.options == {"b": 1}
+    assert str(req.requirement) == "a"
+    assert (req.from_file, req.lineno) == (str(tmp_path), 1)
+
+
+def test_parsed_requirement_repr_with_opt(tmp_path: Path) -> None:
+    req = ParsedRequirement("a", {"b": 1}, str(tmp_path), 1)
+    assert repr(req) == "ParsedRequirement(requirement=a, options={'b': 1})"
+
+
+def test_parsed_requirement_repr_no_opt(tmp_path: Path) -> None:
+    assert repr(ParsedRequirement("a", {}, str(tmp_path), 2)) == "ParsedRequirement(requirement=a)"
+
+
+@pytest.mark.parametrize(
+    ("flag", "is_constraint", "req_file_str", "found"),
+    [
+        pytest.param("-r", False, "-r", "a", id="dash-r"),
+        pytest.param("--requirement", False, "-r", "a", id="dash-dash-requirement"),
+        pytest.param("-c", True, "-c", "-c a", id="dash-c"),
+        pytest.param("--constraint", True, "-c", "-c a", id="dash-dash-constraint"),
+    ],
+)
+def test_req_over_http(
+    tmp_path: Path, flag: str, is_constraint: bool, req_file_str: str, found: str, mocker: MockerFixture
+) -> None:
+    url_open = mocker.patch("tox.tox_env.python.pip.req.file.urlopen", autospec=True)
+    url_open.return_value.__enter__.return_value = BytesIO(b"-i i\na")
+    requirements_txt = tmp_path / "req.txt"
+    requirements_txt.write_text(f"{flag} https://zopefoundation.github.io/Zope/releases/4.5.5/requirements-full.txt")
+    req_file = RequirementsFile(requirements_txt, constraint=is_constraint)
+    assert str(req_file) == f"{req_file_str} {requirements_txt}"
+    assert req_file.options == Namespace(index_url=["i"])
+    assert [str(i) for i in req_file.requirements] == [found]
+    # urlopen must be called with a timeout to avoid hanging on slow / unresponsive mirrors
+    assert url_open.call_args.kwargs.get("timeout") is not None
+
+
+def test_req_file_over_size_limit(tmp_path: Path) -> None:
+    (tmp_path / "big.txt").write_bytes(b"a" * (10 * 1024 * 1024 + 1))
+    requirements_txt: Final[Path] = tmp_path / "req.txt"
+    requirements_txt.write_text("-c big.txt")
+    with pytest.raises(ValueError, match=r"big\.txt exceeds the 10485760 byte limit"):
+        _ = RequirementsFile(requirements_txt, constraint=False).requirements
+
+
+def test_req_file_at_size_limit(tmp_path: Path) -> None:
+    requirements_txt: Final[Path] = tmp_path / "req.txt"
+    requirements_txt.write_bytes(b"#" * (10 * 1024 * 1024 - len(b"\nvalid\n")) + b"\nvalid\n")
+    assert [str(requirement) for requirement in RequirementsFile(requirements_txt, constraint=False).requirements] == [
+        "valid"
+    ]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="/dev/zero is a POSIX device")
+def test_req_file_endless_stream_is_bounded(tmp_path: Path) -> None:
+    requirements_txt: Final[Path] = tmp_path / "req.txt"
+    requirements_txt.write_text("-c /dev/zero")
+    with pytest.raises(ValueError, match="exceeds the 10485760 byte limit"):
+        _ = RequirementsFile(requirements_txt, constraint=False).requirements
+
+
+def test_req_over_http_slow_drip_hits_deadline(tmp_path: Path, mocker: MockerFixture) -> None:
+    requirements_txt: Final[Path] = tmp_path / "req.txt"
+    requirements_txt.write_text("-c https://user:hunter2@example.com/c.txt")
+    reader, writer = socket.socketpair()
+    with reader, writer:
+        reader.settimeout(0.05)
+        writer.sendall(b"HTTP/1.1 200 OK\r\n\r\n#")
+        response: Final[HTTPResponse] = HTTPResponse(reader)
+        response.begin()
+        mocker.patch("tox.tox_env.python.pip.req.file.urlopen", autospec=True, return_value=response)
+        mocker.patch("tox.tox_env.python.pip.req.file.monotonic", autospec=True, side_effect=[0, 121])
+        with pytest.raises(ValueError, match=r"https://example\.com/c\.txt took longer than 120 seconds") as exc:
+            _ = RequirementsFile(requirements_txt, constraint=False).requirements
+        assert "hunter2" not in str(exc.value)
+
+
+def test_req_over_http_has_req(tmp_path: Path, mocker: MockerFixture) -> None:
+    @contextmanager
+    def enter(  # interface signature
+        url: str,
+        timeout: float | None = None,  # ruff:ignore[unused-function-argument]  # interface signature
+    ) -> Generator[IO[bytes], None, None]:
+        if url == "https://root.org/a.txt":
+            yield BytesIO(b"-r b.txt")
+        elif url == "https://root.org/b.txt":
+            yield BytesIO(b"-i i\na")
+        else:  # pragma: no cover  # setup not built by tests
+            raise RuntimeError  # pragma: no cover  # untested error path
+
+    mocker.patch("tox.tox_env.python.pip.req.file.urlopen", autospec=True, side_effect=enter)
+
+    requirements_txt = tmp_path / "req.txt"
+    requirements_txt.write_text("-r https://root.org/a.txt")
+    req_file = RequirementsFile(requirements_txt, constraint=False)
+
+    assert req_file.options == Namespace(index_url=["i"])
+    found = [str(i) for i in req_file.requirements]
+    assert found == ["a"]
+
+
+@pytest.mark.parametrize(
+    "loc",
+    [
+        pytest.param(
+            "file://",
+            id="file-colon-slash-slash",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="posix file uri"),
+        ),
+        pytest.param(
+            "file:///",
+            id="file-colon-slash-slash-slash-windows",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="windows file uri"),
+        ),
+        pytest.param(
+            "file://localhost",
+            id="file-colon-slash-slash-localhost",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="posix file uri"),
+        ),
+        pytest.param(
+            "file://localhost/",
+            id="file-colon-slash-slash-localhost-windows",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="windows file uri"),
+        ),
+    ],
+)
+def test_requirement_via_file_protocol(tmp_path: Path, loc: str) -> None:
+    other_req = tmp_path / "other-requirements.txt"
+    other_req.write_text("-i i\na")
+    requirements_text = tmp_path / "req.txt"
+    requirements_text.write_text(f"-r {loc}{other_req}")
+
+    req_file = RequirementsFile(requirements_text, constraint=False)
+
+    assert req_file.options == Namespace(index_url=["i"])
+    found = [str(i) for i in req_file.requirements]
+    assert found == ["a"]
+
+
+@pytest.mark.parametrize(
+    "loc",
+    [
+        pytest.param(
+            "file://magic.com",
+            id="posix",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="posix file uri"),
+        ),
+        pytest.param(
+            "file://magic.com/",
+            id="windows",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="windows file uri"),
+        ),
+    ],
+)
+def test_requirement_via_file_protocol_na(tmp_path: Path, loc: str) -> None:
+    other_req = tmp_path / "other-requirements.txt"
+    other_req.write_text("-i i\na")
+    requirements_text = tmp_path / "req.txt"
+    requirements_text.write_text(f"-r {loc}{other_req}")
+
+    req_file = RequirementsFile(requirements_text, constraint=False)
+    pattern = r"non-local file URIs are not supported on this platform: 'file://magic\.com\.*"
+    with pytest.raises(ValueError, match=pattern):
+        assert req_file.options
+
+
+@pytest.mark.parametrize(
+    "req",
+    [
+        pytest.param("pre-commit ~= 4", id="pre-dash-commit-space-tilde-equal-space-4"),
+        pytest.param("pre-commit~=4", id="pre-dash-commit-tilde-equal-4"),
+    ],
+)
+def test_requirement_with_tilde_equals_not_treated_as_path(tmp_path: Path, req: str) -> None:
+    # Deps with ``~=`` version specifier should not be treated as local paths (#3447).
+    parsed = ParsedRequirement(req, {}, str(tmp_path / "tox.ini"), 1)
+    assert str(parsed.requirement) == req
+
+
+def test_requirement_to_path_one_level_up(tmp_path: Path) -> None:
+    other_req = tmp_path / "other.txt"
+    other_req.write_text("-e ..")
+    result = RequirementsFile(other_req, constraint=False).requirements
+    assert result[0].requirement == str(tmp_path.parent.resolve())

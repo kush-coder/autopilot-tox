@@ -1,0 +1,259 @@
+from __future__ import annotations
+
+import json
+import sys
+from textwrap import dedent
+from typing import TYPE_CHECKING, Final
+
+import pytest
+
+if TYPE_CHECKING:
+    from tests.conftest import PatchPrevPy
+    from tox.pytest import ToxProjectCreator
+
+
+def test_depends_wheel(tox_project: ToxProjectCreator, patch_prev_py: PatchPrevPy) -> None:
+    prev_ver, impl, _ = patch_prev_py(True)  # has previous python
+    ver = sys.version_info[0:2]
+    py = f"py{''.join(str(i) for i in ver)}"
+    prev_py = f"py{prev_ver}"
+    ini = f"""
+    [tox]
+    env_list = py,{py},{prev_py},py31,cov2,cov
+    [testenv]
+    package = wheel
+    [testenv:cov]
+    depends = py,{py},{prev_py},py31
+    skip_install = true
+    [testenv:cov2]
+    depends = cov
+    skip_install = true
+    """
+    outcome = tox_project({"tox.ini": ini, "pyproject.toml": ""}).run("de")
+    outcome.assert_success()
+
+    expected = f"""
+    Execution order: py, {py}, {prev_py}, py31, cov, cov2
+    ALL
+       py ~ .pkg
+       {py} ~ .pkg
+       {prev_py} ~ .pkg | .pkg-{impl}{prev_ver}
+       py31 ~ .pkg
+       cov2
+          cov
+             py ~ .pkg
+             {py} ~ .pkg
+             {prev_py} ~ .pkg | .pkg-{impl}{prev_ver}
+             py31 ~ .pkg
+       cov
+          py ~ .pkg
+          {py} ~ .pkg
+          {prev_py} ~ .pkg | .pkg-{impl}{prev_ver}
+          py31 ~ .pkg
+    """
+    assert outcome.out == dedent(expected).lstrip()
+
+
+def test_depends_sdist(tox_project: ToxProjectCreator, patch_prev_py: PatchPrevPy) -> None:
+    prev_ver, _impl, _ = patch_prev_py(True)  # has previous python
+    ver = sys.version_info[0:2]
+    py = f"py{''.join(str(i) for i in ver)}"
+    prev_py = f"py{prev_ver}"
+    ini = f"""
+    [tox]
+    env_list = py,{py},{prev_py},py31,cov2,cov
+    [testenv]
+    package = sdist
+    [testenv:cov]
+    depends = py,{py},{prev_py},py31
+    skip_install = true
+    [testenv:cov2]
+    depends = cov
+    skip_install = true
+    """
+    outcome = tox_project({"tox.ini": ini, "pyproject.toml": ""}).run("de")
+    outcome.assert_success()
+
+    expected = f"""
+    Execution order: py, {py}, {prev_py}, py31, cov, cov2
+    ALL
+       py ~ .pkg
+       {py} ~ .pkg
+       {prev_py} ~ .pkg
+       py31 ~ .pkg
+       cov2
+          cov
+             py ~ .pkg
+             {py} ~ .pkg
+             {prev_py} ~ .pkg
+             py31 ~ .pkg
+       cov
+          py ~ .pkg
+          {py} ~ .pkg
+          {prev_py} ~ .pkg
+          py31 ~ .pkg
+    """
+    assert outcome.out == dedent(expected).lstrip()
+
+
+_GLOB_CASES: Final[list[pytest.ParameterSet]] = [
+    pytest.param(
+        ["3.12", "3.13", "3.14", "lint", "cov"],
+        ["3.*"],
+        """\
+        Execution order: 3.12, 3.13, 3.14, lint, cov
+        ALL
+           3.12
+           3.13
+           3.14
+           lint
+           cov
+              3.12
+              3.13
+              3.14
+        """,
+        id="star",
+    ),
+    pytest.param(
+        ["a1", "a2", "ab", "cov"],
+        ["a?"],
+        """\
+        Execution order: a1, a2, ab, cov
+        ALL
+           a1
+           a2
+           ab
+           cov
+              a1
+              a2
+              ab
+        """,
+        id="question_mark",
+    ),
+    pytest.param(
+        ["lint-a", "lint-b", "lint-c", "cov"],
+        ["lint-[ab]"],
+        """\
+        Execution order: lint-a, lint-b, lint-c, cov
+        ALL
+           lint-a
+           lint-b
+           lint-c
+           cov
+              lint-a
+              lint-b
+        """,
+        id="char_set",
+    ),
+    pytest.param(
+        ["lint-a", "lint-b", "lint-c", "cov"],
+        ["lint-[!ab]"],
+        """\
+        Execution order: lint-a, lint-b, lint-c, cov
+        ALL
+           lint-a
+           lint-b
+           lint-c
+           cov
+              lint-c
+        """,
+        id="negated_char_set",
+    ),
+    pytest.param(
+        ["lint", "cov"],
+        ["py*"],
+        """\
+        Execution order: lint, cov
+        ALL
+           lint
+           cov
+        """,
+        id="no_match",
+    ),
+    pytest.param(
+        ["3.13", "3.14", "lint", "cov"],
+        ["lint", "3.*"],
+        """\
+        Execution order: 3.13, 3.14, lint, cov
+        ALL
+           3.13
+           3.14
+           lint
+           cov
+              3.13
+              3.14
+              lint
+        """,
+        id="mixed",
+    ),
+    pytest.param(
+        ["a", "b", "cov"],
+        ["*"],
+        """\
+        Execution order: a, b, cov
+        ALL
+           a
+           b
+           cov
+              a
+              b
+        """,
+        id="excludes_self",
+    ),
+]
+
+
+@pytest.mark.parametrize(("env_list", "depends", "expected"), _GLOB_CASES)
+def test_depends_glob_toml(
+    tox_project: ToxProjectCreator, env_list: list[str], depends: list[str], expected: str
+) -> None:
+    conf = f"""
+    env_list = {json.dumps(env_list)}
+    [env_run_base]
+    package = "skip"
+    [env.cov]
+    depends = {json.dumps(depends)}
+    """
+    outcome = tox_project({"tox.toml": conf}).run("de")
+    outcome.assert_success()
+    assert outcome.out == dedent(expected)
+
+
+@pytest.mark.parametrize(("env_list", "depends", "expected"), _GLOB_CASES)
+def test_depends_glob_ini(
+    tox_project: ToxProjectCreator, env_list: list[str], depends: list[str], expected: str
+) -> None:
+    conf = f"""
+    [tox]
+    env_list = {",".join(env_list)}
+    [testenv]
+    skip_install = true
+    [testenv:cov]
+    depends = {",".join(depends)}
+    """
+    outcome = tox_project({"tox.ini": conf}).run("de")
+    outcome.assert_success()
+    assert outcome.out == dedent(expected)
+
+
+def test_depends_help(tox_project: ToxProjectCreator) -> None:
+    tox_project({"tox.ini": ""}).run("de", "-h").assert_success()
+
+
+def test_depends_circular(tox_project: ToxProjectCreator) -> None:
+    ini = "[tox]\nenv_list = a,b\n[testenv]\npackage = skip\n[testenv:a]\ndepends = b\n[testenv:b]\ndepends = a\n"
+
+    outcome = tox_project({"tox.ini": ini}).run("de")
+
+    outcome.assert_failed(code=-2)
+    assert "circular dependency detected between environments: a | b" in outcome.out, outcome.out
+
+
+def test_depends_circular_run(tox_project: ToxProjectCreator) -> None:
+    ini = "[tox]\nenv_list = a,b\n[testenv]\npackage = skip\n[testenv:a]\ndepends = b\n[testenv:b]\ndepends = a\n"
+
+    outcome = tox_project({"tox.ini": ini}).run("r", "--notest")
+
+    outcome.assert_failed(code=-2)
+    assert "circular dependency detected between environments: a | b" in outcome.out, outcome.out
+    assert "Traceback" not in outcome.err, outcome.err

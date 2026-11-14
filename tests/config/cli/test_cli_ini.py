@@ -1,0 +1,317 @@
+from __future__ import annotations
+
+import logging
+import sys
+import textwrap
+from argparse import Namespace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import pytest
+
+from tox.config.cli.ini import IniConfig
+from tox.config.cli.parse import get_options
+from tox.config.cli.parser import Parsed
+from tox.config.loader.api import Override
+from tox.config.main import Config
+from tox.config.source import Source, discover_source
+from tox.session.env_select import CliEnv
+from tox.util.ci import is_ci
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pytest_mock import MockerFixture
+
+    from tox.pytest import CaptureFixture, LogCaptureFixture, MonkeyPatch
+    from tox.session.state import State
+
+
+@pytest.fixture
+def default_options(
+    mocker: MockerFixture,
+) -> dict[str, Any]:  # simplint: ignore[imprecise-annotation]  # test options hold values of any type
+    return {
+        "colored": "no",
+        "stderr_color": "RED",
+        "command": "r",
+        "default_runner": "virtualenv",
+        "develop": False,
+        "discover": [],
+        "env": CliEnv(),
+        "hash_seed": mocker.ANY,
+        "install_pkg": None,
+        "fail_fast": False,
+        "no_test": False,
+        "no_capture": False,
+        "override": [],
+        "package_only": False,
+        "quiet": 0,
+        "recreate": False,
+        "no_recreate_provision": False,
+        "no_provision": False,
+        "no_recreate_pkg": False,
+        "result_json": None,
+        "skip_missing_interpreters": "config",
+        "skip_pkg_install": False,
+        "skip_env_install": False,
+        "verbose": 2,
+        "work_dir": None,
+        "root_dir": None,
+        "config_file": None,
+        "factors": [],
+        "labels": [],
+        "exit_and_dump_after": 0,
+        "skip_env": "",
+        "list_dependencies": is_ci(),
+        "remainder": [],
+    }
+
+
+@pytest.mark.parametrize("content", ["[tox]", ""])
+def test_ini_empty(
+    tmp_path: Path,
+    core_handlers: dict[str, Callable[[State], int]],
+    default_options: dict[str, Any],  # simplint: ignore[imprecise-annotation]  # test options hold values of any type
+    mocker: MockerFixture,
+    monkeypatch: MonkeyPatch,
+    content: str,
+) -> None:
+    to = tmp_path / "tox.ini"
+    monkeypatch.setenv("TOX_USER_CONFIG_FILE", str(to))
+    to.write_text(content)
+    mocker.patch(
+        "tox.config.cli.parse.discover_source",
+        autospec=True,
+        return_value=mocker.create_autospec(Source, instance=True, path=Path()),
+    )
+    options = get_options("r")
+    assert options.parsed == Namespace(**default_options)
+    assert options.parsed.verbosity == 2
+    assert options.cmd_handlers == core_handlers
+
+    to.unlink()
+    missing_options = get_options("r")
+    missing_options.parsed.hash_seed = mocker.ANY
+    assert missing_options.parsed == options.parsed
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            "PermissionError(13, 'Permission denied')",
+            marks=pytest.mark.skipif(sys.platform != "win32", reason="windows reports a permission error"),
+            id="windows",
+        ),
+        pytest.param(
+            "IsADirectoryError(21, 'Is a directory')",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="posix reports a directory error"),
+            id="posix",
+        ),
+    ],
+)
+def test_bad_cli_ini(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+    default_options: dict[str, Any],  # simplint: ignore[imprecise-annotation]  # test options hold values of any type
+    mocker: MockerFixture,
+    error: str,
+) -> None:
+    mocker.patch(
+        "tox.config.cli.parse.discover_source",
+        autospec=True,
+        return_value=mocker.create_autospec(Source, instance=True, path=Path()),
+    )
+    caplog.set_level(logging.WARNING)
+    monkeypatch.setenv("TOX_USER_CONFIG_FILE", str(tmp_path))
+    options = get_options("r")
+    assert caplog.messages == [f"failed to read config file {tmp_path} because {error}"]
+    assert options.parsed == Namespace(**default_options)
+
+
+def test_bad_option_cli_ini(
+    tmp_path: Path,
+    monkeypatch: MonkeyPatch,
+    caplog: LogCaptureFixture,
+    default_options: dict[str, Any],  # simplint: ignore[imprecise-annotation]  # test options hold values of any type
+) -> None:
+    caplog.set_level(logging.WARNING)
+    to = tmp_path / "tox.ini"
+    to.write_text(
+        textwrap.dedent(
+            """
+        [tox]
+        verbose = what
+
+        """,
+        ),
+    )
+    monkeypatch.setenv("TOX_USER_CONFIG_FILE", str(to))
+    parsed, _, __, ___, ____ = get_options("r")
+    assert caplog.messages == [
+        "{} key verbose as type <class 'int'> failed with {}".format(
+            to,
+            "HandledError(\"failed to load core.verbose: invalid literal for int() with base 10: 'what'\")",
+        ),
+    ]
+    assert parsed == Namespace(**default_options)
+
+
+def test_cli_ini_with_interpolated(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    to = tmp_path / "tox.ini"
+    to.write_text("[tox]\na = %(b)s")
+    monkeypatch.setenv("TOX_USER_CONFIG_FILE", str(to))
+    conf = IniConfig()
+    assert conf.get("a", str)
+
+
+def test_cli_ini_is_utf8(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    to = tmp_path / "tox.ini"
+    to.write_text("[tox]\na = “Grüße”\n", encoding="utf-8")
+    monkeypatch.setenv("TOX_USER_CONFIG_FILE", str(to))
+    conf = IniConfig()
+    assert conf.has_config_file is True
+    assert conf.get("a", str) == ("“Grüße”", "file")
+
+
+def test_cli_ini_with_utf8_bom(tmp_path: Path, monkeypatch: MonkeyPatch) -> None:
+    to = tmp_path / "tox.ini"
+    to.write_bytes(b"\xef\xbb\xbf[tox]\na = b\n")
+    monkeypatch.setenv("TOX_USER_CONFIG_FILE", str(to))
+    conf = IniConfig()
+    assert conf.has_config_file is True
+    assert conf.get("a", str) == ("b", "file")
+
+
+@pytest.mark.parametrize(
+    ("conf_arg", "filename", "content"),
+    [
+        pytest.param("", "tox.ini", "[tox]", id="ini-dir"),
+        pytest.param("tox.ini", "tox.ini", "[tox]", id="ini"),
+        pytest.param("", "setup.cfg", "[tox:tox]", id="cfg-dir"),
+        pytest.param("setup.cfg", "setup.cfg", "[tox:tox]", id="cfg"),
+        pytest.param("custom.ini", "custom.ini", "[tox]", id="custom"),
+        pytest.param("", "pyproject.toml", '[tool.tox]\nlegacy_tox_ini = """\n[tox]\n"""\n', id="toml-dir"),
+        pytest.param("pyproject.toml", "pyproject.toml", '[tool.tox]\nlegacy_tox_ini = """\n[tox]\n"""\n', id="toml"),
+    ],
+)
+def test_conf_arg(tmp_path: Path, conf_arg: str, filename: str, content: str) -> None:
+    dest = tmp_path / "c"
+    dest.mkdir()
+    (dest / filename).write_bytes(content.encode(encoding="utf-8"))
+
+    config_file = dest / conf_arg
+    source = discover_source(config_file, None)
+
+    config = Config.make(
+        Parsed(work_dir=dest, override=[], config_file=config_file, root_dir=None),
+        pos_args=[],
+        source=source,
+        extra_envs=(),
+    )
+    assert config.src_path == dest / filename
+
+
+@pytest.fixture
+def exhaustive_ini(tmp_path: Path, monkeypatch: MonkeyPatch) -> Path:
+    to = tmp_path / "tox.ini"
+    to.write_text(
+        textwrap.dedent(
+            """
+        [tox]
+        colored = yes
+        verbose = 5
+        quiet = 1
+        command = run-parallel
+        env = py37, py36
+        default_runner = virtualenv
+        recreate = true
+        no_test = true
+        parallel = 3
+        parallel_live = True
+        override =
+            a=b
+            c=d
+        """,
+        ),
+    )
+    monkeypatch.setenv("TOX_USER_CONFIG_FILE", str(to))
+    return to
+
+
+@pytest.mark.usefixtures("exhaustive_ini")
+def test_ini_exhaustive_parallel_values(
+    core_handlers: dict[str, Callable[[State], int]], mocker: MockerFixture
+) -> None:
+    options = get_options("p")
+    assert options.parsed == Namespace(
+        colored="yes",
+        stderr_color="RED",
+        command="p",
+        default_runner="virtualenv",
+        develop=False,
+        discover=[],
+        env=CliEnv(["py37", "py36"]),
+        hash_seed=mocker.ANY,
+        install_pkg=None,
+        fail_fast=False,
+        no_test=True,
+        no_capture=False,
+        override=[Override("a=b"), Override("c=d")],
+        package_only=False,
+        no_recreate_pkg=False,
+        parallel=3,
+        parallel_live=True,
+        parallel_no_spinner=False,
+        quiet=1,
+        no_provision=False,
+        recreate=True,
+        no_recreate_provision=False,
+        result_json=None,
+        skip_missing_interpreters="config",
+        skip_pkg_install=False,
+        skip_env_install=False,
+        verbose=5,
+        work_dir=None,
+        root_dir=None,
+        config_file=None,
+        factors=[],
+        labels=[],
+        exit_and_dump_after=0,
+        skip_env="",
+        list_dependencies=is_ci(),
+        remainder=[],
+    )
+    assert options.parsed.verbosity == 4
+    assert options.cmd_handlers == core_handlers
+
+
+def test_ini_help(exhaustive_ini: Path, capfd: CaptureFixture) -> None:
+    with pytest.raises(SystemExit) as context:
+        get_options("-h")
+    assert context.value.code == 0
+    out, err = capfd.readouterr()
+    assert not err
+    res = out.splitlines()[-1]
+    msg = f"config file {str(exhaustive_ini)!r} active (changed via env var TOX_USER_CONFIG_FILE)"
+    assert res == msg
+
+
+def test_ini_loader_corrupt_default_config_file(
+    mocker: MockerFixture,
+    tmp_path: Path,
+    caplog: LogCaptureFixture,
+) -> None:
+    # Setup: Create a corrupt DEFAULT_CONFIG_FILE and point to it.
+    config_file = tmp_path / "config.ini"
+    config_file.write_text("[tox\n")
+    mocker.patch("tox.config.cli.ini.DEFAULT_CONFIG_FILE", config_file)
+
+    # Act
+    IniConfig()
+
+    # Verify
+    assert "failed to read config file None" not in caplog.messages[0]
+    assert f"failed to read config file {config_file}" in caplog.messages[0]

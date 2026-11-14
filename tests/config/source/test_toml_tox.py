@@ -1,0 +1,262 @@
+from __future__ import annotations
+
+import sys
+import textwrap
+from string import Template
+from typing import TYPE_CHECKING, Final, Protocol
+
+import pytest
+
+from tox.config.loader.str_convert import StrConvert
+from tox.config.types import Command
+
+if TYPE_CHECKING:
+    from tox.pytest import ToxProject, ToxProjectCreator, ToxRunOutcome
+
+
+def test_config_in_toml_core(tox_project: ToxProjectCreator) -> None:
+    project = tox_project({
+        "tox.toml": """
+    env_list = [ "A", "B"]
+
+    [env_run_base]
+    description = "Do magical things"
+    commands = [
+        ["python", "--version"],
+        ["python", "-c", "import sys; print(sys.executable)"]
+    ]
+    """
+    })
+
+    outcome = project.run("c", "--core")
+    outcome.assert_success()
+    assert "# Exception: " not in outcome.out, outcome.out
+    assert "# !!! unused: " not in outcome.out, outcome.out
+
+
+def test_config_in_toml_non_default(tox_project: ToxProjectCreator) -> None:
+    project = tox_project({
+        "tox.toml": """
+    [env.C]
+    description = "Do magical things in C"
+    commands = [
+        ["python", "--version"]
+    ]
+    """
+    })
+
+    outcome = project.run("c", "-e", "C", "--core")
+    outcome.assert_success()
+    assert "# Exception: " not in outcome.out, outcome.out
+    assert "# !!! unused: " not in outcome.out, outcome.out
+
+
+def test_config_in_toml_extra(tox_project: ToxProjectCreator) -> None:
+    project = tox_project({
+        "tox.toml": """
+    [env_run_base]
+    description = "Do magical things"
+    commands = [
+        ["python", "--version"]
+    ]
+    """
+    })
+
+    outcome = project.run("c", "-e", ".".join(str(i) for i in sys.version_info[0:2]))
+    outcome.assert_success()
+    assert "# Exception: " not in outcome.out, outcome.out
+    assert "# !!! unused: " not in outcome.out, outcome.out
+
+
+@pytest.fixture(
+    params=[
+        pytest.param(("tox.toml", ""), id="tox.toml"),
+        pytest.param(("pyproject.toml", "tool.tox."), id="pyproject.toml"),
+    ]
+)
+def toml_project(request: pytest.FixtureRequest, tox_project: ToxProjectCreator) -> _TomlProjectCreator:
+    filename, prefix = request.param
+
+    def create(content: str) -> ToxProject:
+        return tox_project({filename: Template(content).substitute(prefix=prefix)})
+
+    return create
+
+
+class _TomlProjectCreator(Protocol):
+    def __call__(self, content: str) -> ToxProject: ...
+
+
+def test_config_in_toml_replace_default(toml_project: _TomlProjectCreator) -> None:
+    outcome = toml_project('[${prefix}env_run_base]\ndescription = "{missing:miss}"').run("c", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:py]\ndescription = miss\n", "")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("{}", id="empty-braces"),
+        pytest.param("{print(1)}", id="function-call"),
+        pytest.param("{'tool': 'tox'}", id="dict-literal"),
+        pytest.param("{'url': 'https://example.com'}", id="url"),
+        pytest.param("{'at': '12:30'}", id="time"),
+    ],
+)
+def test_config_in_toml_keep_braces_of_non_reference(toml_project: _TomlProjectCreator, text: str) -> None:
+    project: Final[ToxProject] = toml_project(f'[${{prefix}}env_run_base]\ncommands = [["python", "-c", "x {text} y"]]')
+    outcome: Final[ToxRunOutcome] = project.run("c", "-k", "commands")
+    outcome.assert_success()
+    assert outcome.out.startswith("[testenv:py]\ncommands = ")
+    assert StrConvert.to_command(outcome.out.partition("commands = ")[2].strip()).args == [
+        "python",
+        "-c",
+        f"x {text} y",
+    ]
+
+
+def test_config_in_toml_keep_braces_around_posargs_naming_a_key(toml_project: _TomlProjectCreator) -> None:
+    outcome: Final[ToxRunOutcome] = toml_project(
+        '[${prefix}env_run_base]\nset_env = { SECRET = "s3cr3t" }\n'
+        'commands = [["python", "-c", \'x {"text": "{posargs}"} y\']]'
+    ).run("c", "-k", "commands", "--", "set_env:x")
+    outcome.assert_success()
+    assert outcome.env_conf("py")["commands"] == [Command(args=["python", "-c", 'x {"text": "set_env:x"} y'])]
+
+
+def test_config_in_toml_replace_env_name_via_env(toml_project: _TomlProjectCreator) -> None:
+    project = toml_project('[${prefix}env_run_base]\ndescription = "Magic in {env:MAGICAL:{env_name}}"')
+    outcome = project.run("c", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:py]\ndescription = Magic in py\n", "")
+
+
+def test_config_in_toml_replace_env_name_via_env_set(
+    toml_project: _TomlProjectCreator, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("MAGICAL", "YEAH")
+    project = toml_project('[${prefix}env_run_base]\ndescription = "Magic in {env:MAGICAL:{env_name}}"')
+    outcome = project.run("c", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:py]\ndescription = Magic in YEAH\n", "")
+
+
+def test_config_in_toml_replace_from_env_section_absolute(toml_project: _TomlProjectCreator) -> None:
+    project = toml_project(
+        """
+        [${prefix}env.A]
+        description = "a"
+        [${prefix}env.B]
+        description = "{[${prefix}env.A]env_name}"
+        """
+    )
+    outcome = project.run("c", "-e", "B", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:B]\ndescription = A\n", "")
+
+
+def test_config_in_toml_replace_from_section_absolute(toml_project: _TomlProjectCreator) -> None:
+    project = toml_project(
+        """
+        [${prefix}extra]
+        ok = "o"
+        [${prefix}env.B]
+        description = "{[${prefix}extra]ok}"
+        """
+    )
+    outcome = project.run("c", "-e", "B", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:B]\ndescription = o\n", "")
+
+
+@pytest.mark.parametrize("filename", ["tox.toml", "pyproject.toml"])
+@pytest.mark.parametrize(
+    ("factor", "env_name", "expected"),
+    [
+        pytest.param('{ ecosystem = ["oci", "python"] }', "oci", "oci", id="first-value"),
+        pytest.param('{ ecosystem = ["oci", "python"] }', "python", "python", id="second-value"),
+        pytest.param('{ ecosystem = ["oci", "python"] }', "lint", "", id="no-match"),
+        pytest.param('{ ecosystem = { values = ["oci", "python"], default = "oci" } }', "lint", "oci", id="default"),
+        pytest.param(
+            '{ ecosystem = { values = ["oci", "python"], default = "oci" } }',
+            "python",
+            "python",
+            id="match-over-default",
+        ),
+        pytest.param(
+            '{ ecosystem = { prefix = "py", start = 312, stop = 313 } }', "py313", "py313", id="labeled-range"
+        ),
+        pytest.param(
+            '{ ecosystem = { prefix = "py", start = 312, stop = 313, default = "py312" } }',
+            "lint",
+            "py312",
+            id="range-default",
+        ),
+        pytest.param('{ prefix = "py", start = 312, stop = 313 }', "py313", "", id="unlabeled-range"),
+    ],
+)
+def test_config_in_toml_env_list_bare_factor(
+    tox_project: ToxProjectCreator, filename: str, factor: str, env_name: str, expected: str
+) -> None:
+    prefix, header = {"pyproject.toml": ("tool.tox.", "[tool.tox]"), "tox.toml": ("", "")}[filename]
+    project: Final = tox_project({
+        filename: f"""
+            {header}
+            env_list = [{factor}]
+            [{prefix}env_run_base]
+            description = "{{factor:ecosystem}}"
+            [{prefix}env.lint]
+        """,
+    })
+    outcome: Final = project.run("c", "-e", env_name, "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err(f"[testenv:{env_name}]\ndescription = {expected}\n", "")
+
+
+def test_config_in_toml_env_list_keyed_factor_description(tox_project: ToxProjectCreator) -> None:
+    project = tox_project({
+        "tox.toml": textwrap.dedent("""\
+            env_list = [
+                { product = [["sync"], {ecosystem = ["oci", "python"]}, {target = ["pw", "tt"]}] },
+            ]
+
+            [env_run_base]
+            package = "skip"
+            description = "Sync {factor:ecosystem} to {factor:target}"
+            commands = [["python", "-c", "print('ok')"]]
+        """),
+    })
+    outcome = project.run("c", "-e", "sync-oci-pw", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:sync-oci-pw]\ndescription = Sync oci to pw\n", "")
+    outcome = project.run("c", "-e", "sync-python-tt", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:sync-python-tt]\ndescription = Sync python to tt\n", "")
+
+
+def test_config_in_toml_override_env_without_own_table(tox_project: ToxProjectCreator) -> None:
+    project = tox_project({
+        "tox.toml": textwrap.dedent("""\
+            [env_run_base]
+            description = "base"
+        """),
+    })
+    outcome = project.run("c", "-e", "py", "-k", "description", "-x", "env.py.description=override")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:py]\ndescription = override\n", "")
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        pytest.param("tox.toml", '[env_run_base]\ndescription = "BOM"\n', id="tox.toml"),
+        pytest.param("pyproject.toml", '[tool.tox.env_run_base]\ndescription = "BOM"\n', id="pyproject.toml"),
+    ],
+)
+def test_config_in_toml_with_utf8_bom(filename: str, content: str, tox_project: ToxProjectCreator) -> None:
+    project = tox_project({filename: content})
+    toml_file = project.path / filename
+    toml_file.write_bytes(b"\xef\xbb\xbf" + toml_file.read_bytes())
+    outcome = project.run("c", "-e", "py", "-k", "description")
+    outcome.assert_success()
+    outcome.assert_out_err("[testenv:py]\ndescription = BOM\n", "")
